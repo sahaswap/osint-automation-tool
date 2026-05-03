@@ -147,7 +147,7 @@ Private Const IDNO  As Long = 7
 '==================================================================
 ' MODULE CONSTANTS
 '==================================================================
-Private Const TOOL_VERSION As String = "2.5.2"
+Private Const TOOL_VERSION As String = "2.5.3"
 Private Const MIN_PDF_SIZE_BYTES As Long = 5120
 Private Const CAPTCHA_SIZE_HINT As Long = 150000   ' below this, likely CAPTCHA
 
@@ -158,7 +158,7 @@ Private Const TIMING_PROFILE As String = "FAST"     ' FAST | NORMAL | SLOW
 Private Const MAX_PARALLEL As Long = 3              ' workers per entity
 Private Const LAUNCH_STAGGER_SEC As Single = 0.4    ' gap between concurrent launches
 Private Const POLL_INTERVAL_SEC As Single = 0.3     ' sleep between completion checks
-Private Const TASK_TIMEOUT_SEC As Long = 60         ' per-task safety net
+Private Const TASK_TIMEOUT_SEC As Long = 90         ' per-task safety net (raised for VDI tail latency)
 
 ' Disk thresholds (GB)
 Private Const DISK_ABORT_GB As Double = 2
@@ -994,11 +994,15 @@ Private Function RunSearchBatchParallel(tasks As Collection, wsh As Object) As L
     Dim retryList As Collection
     Set retryList = New Collection
 
+    ' v2.5.3: retry ANY task whose first attempt did not produce a
+    ' full-size PDF. Includes:
+    '   size = 0          (timeout - file never created)
+    '   size <= MIN       (stub/corrupt)
+    '   size < CAPTCHA    (likely CAPTCHA page)
     Dim i As Long, a As Variant
     For i = 1 To n
         If i <= UBound(initialSizes) Then
-            If initialSizes(i) > MIN_PDF_SIZE_BYTES And _
-               initialSizes(i) < CAPTCHA_SIZE_HINT Then
+            If initialSizes(i) < CAPTCHA_SIZE_HINT Then
                 retryList.Add tasks(i)
             End If
         End If
@@ -1283,7 +1287,7 @@ Private Function BuildHeadlessEdgeCmd(ByVal Query As String, _
     s = s & " --disable-gpu"
     s = s & " --disable-blink-features=AutomationControlled"
     s = s & " --user-agent=""" & ua & """"
-    s = s & " --window-size=1280,900"
+    s = s & " --window-size=1920,1080"
     s = s & " --accept-lang=""en-US,en;q=0.9"""
     s = s & " --user-data-dir=""" & profilePath & """"
     s = s & " --no-first-run"
@@ -1298,6 +1302,7 @@ Private Function BuildHeadlessEdgeCmd(ByVal Query As String, _
     s = s & " --mute-audio"
     s = s & " --hide-scrollbars"
     s = s & " --no-pings"
+    s = s & " --virtual-time-budget=10000"   ' v2.5.3: cap JS wait at 10s
     s = s & " --print-to-pdf=""" & savePath & """"
     s = s & " """ & baseURL & """"
 
