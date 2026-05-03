@@ -1,89 +1,23 @@
 '==================================================================
-' OSINT AUTOMATION TOOL v2.5.2
+' OSINT Automation Tool
 '
-' Changelog v2.5.0 -> v2.5.2:
+' Runs a batch of Google OSINT searches for a customer and their
+' counterparties, saves each result page as a PDF straight into
+' the ECM case folder, and writes an audit trail back to the
+' workbook and the shared SharePoint tracker.
 '
-'   v2.5.1 (flag cleanup)
-'   - Stripped "--disable-features=...,VizDisplayCompositor,..."
-'     from the headless cmdline - it was forcing the slow legacy
-'     rasterizer and was the main perf regression vs v2.4.5.
-'   - Also dropped --disable-breakpad, --disable-translate,
-'     --disable-ipc-flooding-protection, --disable-hang-monitor
-'     (marginal or net-negative in our tests).
+' Headless Edge does the heavy lifting. A small worker pool lets
+' a couple of searches run in parallel so a typical 20-30 search
+' job finishes in a few minutes instead of the better part of ten.
 '
-'   v2.5.2 (architecture + retry)
-'   - Cross-entity batching: customer + all CP tasks are added to
-'     ONE flat queue and dispatched through a single 3-worker pool.
-'     Old code drained the pool between entities (tail-idle); new
-'     code keeps all 3 workers saturated end-to-end.
-'   - CAPTCHA retry: after the initial pass, any task whose PDF is
-'     > MIN_PDF_SIZE_BYTES but < CAPTCHA_SIZE_HINT (150 KB) is
-'     retried once after a 15 s cooldown. Final success count is
-'     re-computed from actual on-disk sizes.
-'   - TIMING_PROFILE default switched to FAST (0.7x internal
-'     waits). Switch back to NORMAL if VDI shows instability.
-'
-' Changelog from v2.4.5 -> v2.5.0:
-'
-'  Bucket 1 - Correctness
-'  ----------------------
-'   - Fixed audit-log "Total Searches" bug (accumulator was wiped
-'     and rebuilt via OneDrive file enumeration, which silently
-'     returned 0 while sync was pending).
-'   - Added global ErrorHandler: unexpected errors now log to the
-'     Audit_Log sheet and show a user dialog instead of silently
-'     exiting via GoTo CleanExit.
-'   - SharePoint-sync failures are now surfaced in the success
-'     dialog instead of silently skipped.
-'   - baseFileName trailing underscore stripped (happened when
-'     alertID was blank -> produced filenames like
-'     "ECM123__Customer_1...").
-'   - Double-space in customer/CP names no longer triggers a false
-'     "middle name detected" prompt.
-'
-'  Bucket 2 - Safe speed wins
-'  --------------------------
-'   - DNS/TLS warmup moved to BEFORE user prompts and made
-'     asynchronous (fire-and-forget), so the handshake completes
-'     while the analyst is filling in prompts.
-'   - WshShell is created once in the main sub and reused by every
-'     headless Edge launch (was re-created per search).
-'   - Headless window size reduced from 1920x1080 -> 1280x900.
-'   - Added hardening flags: --disable-breakpad, --mute-audio,
-'     --hide-scrollbars, --password-store=basic,
-'     --use-mock-keychain, --metrics-recording-only,
-'     --disable-hang-monitor, --disable-default-apps,
-'     --disable-component-update, --no-pings,
-'     --disable-ipc-flooding-protection, --disable-translate.
-'   - Added --virtual-time-budget=8000 so headless treats 8s of JS
-'     timers as having elapsed immediately.
-'   - SharePoint push moved to AFTER the folder open, so the
-'     analyst sees the ECM folder without waiting for WebDAV.
-'   - URLEncode hex now zero-padded (%0A instead of %A).
-'
-'  Bucket 3 - Architectural speed win
-'  ----------------------------------
-'   - Parallel 3-worker headless dispatch, scoped per-entity.
-'   - Each worker uses its own --user-data-dir
-'     (OSINT_EdgeWorker_0 / _1 / _2) so profile locks don't
-'     collide between concurrent msedge.exe instances.
-'   - Non-blocking wsh.Run launches + file-poll completion
-'     detection (file exists AND size > MIN_PDF_SIZE_BYTES).
-'   - 0.4 s launch stagger to stay under Google rate limits.
-'   - 60 s per-task timeout. Orphans are left to self-exit.
-'
-' Expected runtime: ~3x faster than v2.4.5 on V2 Cloud
-' (2 vCPU / 16 GB). A typical 50-search run drops from
-' ~4:30 to ~1:30.
-'
-' To run: Assign "SearchAndSavePDF_Direct" to your macro button.
+' To run: assign "SearchAndSavePDF_Direct" to your macro button.
 '==================================================================
 
 Option Explicit
 
-'==================================================================
-' WINDOWS API DECLARATIONS
-'==================================================================
+' Direct Win32 imports - we reach past the VBA wrappers for things
+' like foreground windows and modal dialogs because the wrappers
+' don't behave well on locked-down / VDI hosts.
 #If VBA7 Then
 Private Declare PtrSafe Function ShellExecute Lib "shell32.dll" Alias "ShellExecuteA" _
     (ByVal hwnd As LongPtr, ByVal lpOperation As String, ByVal lpFile As String, _
@@ -128,9 +62,7 @@ Private Declare Function MessageBoxW Lib "user32" ( _
     ByVal lpCaption As Long, ByVal uType As Long) As Long
 #End If
 
-'==================================================================
-' Win32 MessageBox flag constants (for TopMostMsgBox)
-'==================================================================
+' Win32 MessageBox flags used by TopMostMsgBox.
 Private Const MB_OK          As Long = &H0
 Private Const MB_YESNO       As Long = &H4
 Private Const MB_ICONERROR   As Long = &H10
@@ -144,36 +76,40 @@ Private Const IDOK  As Long = 1
 Private Const IDYES As Long = 6
 Private Const IDNO  As Long = 7
 
-'==================================================================
-' MODULE CONSTANTS
-'==================================================================
-Private Const TOOL_VERSION As String = "2.5.6"
+' ---- Tunables ----
+' Anything above MIN_PDF_SIZE_BYTES is treated as a real PDF.
+' Anything below CAPTCHA_SIZE_HINT is suspiciously small and flagged
+' for a retry, since Google's interstitial/CAPTCHA pages tend to
+' render tiny compared to a normal 100-result SERP.
+Private Const TOOL_VERSION As String = "2.5.7"
 Private Const MIN_PDF_SIZE_BYTES As Long = 5120
-Private Const CAPTCHA_SIZE_HINT As Long = 80000    ' below this, likely CAPTCHA (real legit PDFs can be ~125 KB)
+Private Const CAPTCHA_SIZE_HINT As Long = 80000
 
 Private Const USE_HEADLESS As Boolean = True
-Private Const TIMING_PROFILE As String = "FAST"     ' FAST | NORMAL | SLOW
+Private Const TIMING_PROFILE As String = "FAST"         ' FAST | NORMAL | SLOW
 
-' Parallel dispatch
-Private Const MAX_PARALLEL As Long = 3              ' workers per pool
-Private Const LAUNCH_STAGGER_SEC As Single = 0.25   ' gap between concurrent launches
-Private Const POLL_INTERVAL_SEC As Single = 0.3     ' sleep between completion checks
-Private Const TASK_TIMEOUT_SEC As Long = 45         ' initial pass timeout
-Private Const RETRY_TIMEOUT_SEC As Long = 60        ' retry/rescue pass timeout
-Private Const RETRY_COOLDOWN_SEC As Single = 5      ' short cooldown before retry
+' Parallel dispatch. Two workers is the sweet spot on a 2-vCPU VDI -
+' a third worker just fights the others for CPU and pushes tasks
+' past the timeout.
+Private Const MAX_PARALLEL As Long = 2
+Private Const LAUNCH_STAGGER_SEC As Single = 0.3        ' breathing room between launches
+Private Const POLL_INTERVAL_SEC As Single = 0.3         ' how often we check for a finished PDF
+Private Const TASK_TIMEOUT_SEC As Long = 75             ' kill a task that is clearly stuck
+Private Const RETRY_TIMEOUT_SEC As Long = 90            ' give retries a little more rope
+Private Const RETRY_COOLDOWN_SEC As Single = 5          ' pause before retrying, in case Google is rate-limiting
 
-' Disk thresholds (GB)
+' Leave the drive alone if it is running out of space.
 Private Const DISK_ABORT_GB As Double = 2
 Private Const DISK_WARN_GB As Double = 5
 
+' Shared tracker that every analyst's run ends up appending to.
 Private Const MASTER_PATH As String = _
     "https://cfsb-my.sharepoint.com/personal/msrivastava_cfsb_com/Documents/" & _
     "L1%20Beta/Beta 2.4_Feedbacks & Issues Encountered.xlsx"
 Private Const MASTER_FILENAME As String = "Beta 2.4_Feedbacks & Issues Encountered.xlsx"
 
-'==================================================================
-' MODULE-LEVEL STATE
-'==================================================================
+' Module state. bAbort is flipped to True when the user presses ESC
+' or any branch wants to unwind cleanly.
 Private bAbort As Boolean
 
 Private m_origCalc As XlCalculation
@@ -184,22 +120,18 @@ Private m_origCursor As XlMousePointer
 Private m_origPrintComm As Boolean
 Private m_runtimeApplied As Boolean
 
-'==================================================================
-' MAIN MACRO
-'==================================================================
+' Entry point. Wire this up to your macro button.
 Sub SearchAndSavePDF_Direct()
 
     On Error GoTo ErrorHandler
 
-    ' Reset debug log at start of every run so the tail is always the current session
+    ' Start every run with a fresh debug log so the tail is always this session.
     On Error Resume Next
     Kill Environ("TEMP") & "\osint_debug.log"
     On Error GoTo ErrorHandler
     LogStep "=== Macro started (v" & TOOL_VERSION & ") ==="
 
-    '--------------------------------------------------------------
-    ' DECLARATIONS
-    '--------------------------------------------------------------
+    ' ---- Declarations ----
     Dim ws As Worksheet, auditWs As Worksheet, masterWs As Worksheet
     Dim WshShell As Object, FSO As Object, ghostApp As Object
     Dim masterWb As Workbook, wb As Workbook
@@ -256,9 +188,9 @@ Sub SearchAndSavePDF_Direct()
     Set WshShell = CreateObject("WScript.Shell")
     Set FSO = CreateObject("Scripting.FileSystemObject")
 
-    '--------------------------------------------------------------
-    ' STEP 1: Resolve paths (dynamic OneDrive detection)
-    '--------------------------------------------------------------
+    ' Figure out where this machine keeps its Desktop - it might be
+    ' under the OneDrive-synced profile or the plain local one.
+    ' We prefer OneDrive so the case folder syncs automatically.
     userProfile = Environ("USERPROFILE")
     If FSO.FolderExists(userProfile & "\OneDrive - Community Federal Savings Bank\Desktop") Then
         desktopPath = userProfile & "\OneDrive - Community Federal Savings Bank\Desktop"
@@ -293,7 +225,7 @@ Sub SearchAndSavePDF_Direct()
     Do While InStr(baseFileName, "__") > 0
         baseFileName = Replace(baseFileName, "__", "_")
     Loop
-    ' Strip leading/trailing underscores (Bucket 1 / D)
+    ' Trim any stray underscores the sanitiser left at the edges.
     Do While Len(baseFileName) > 0 And Right(baseFileName, 1) = "_"
         baseFileName = Left(baseFileName, Len(baseFileName) - 1)
     Loop
@@ -309,17 +241,14 @@ Sub SearchAndSavePDF_Direct()
 
     totalCPs = Application.CountA(ws.Range("J19:J24"))
 
-    '--------------------------------------------------------------
-    ' STEP 2: Kick off async DNS/TLS warmup (fire-and-forget)
-    '         Runs in the background while user clicks through prompts.
-    '--------------------------------------------------------------
+    ' Kick off DNS/TLS warmup early so the handshake is already
+    ' done by the time the user is through the prompts.
     LogStep "STEP 2: before AutoPrewarmDNS"
     AutoPrewarmDNS
     LogStep "STEP 2: after AutoPrewarmDNS"
 
-    '--------------------------------------------------------------
-    ' STEP 3: User prompts
-    '--------------------------------------------------------------
+    ' Collect the small bits of input we need from the analyst:
+    ' negative-news variants and any extra addresses.
     If custName <> "" Then
         LogStep "STEP 3: before customer negnews InputBox"
         Application.StatusBar = "OSINT: Waiting for Customer Negative News input..."
@@ -332,7 +261,7 @@ Sub SearchAndSavePDF_Direct()
         LogStep "STEP 3: customer negnews returned, len=" & Len(custNameNegNews)
         If StrPtr(custNameNegNews) = 0 Then Exit Sub
 
-        ' Normalize internal whitespace so "John  Smith" doesn't fake a middle name (Bucket 1 / E)
+        ' Collapse runs of spaces so "John  Smith" doesn't look like a middle-name case.
         custNameNegNews = NormalizeSpaces(custNameNegNews)
         LogStep "STEP 3: after NormalizeSpaces, len=" & Len(custNameNegNews)
 
@@ -421,20 +350,17 @@ Sub SearchAndSavePDF_Direct()
         "Starting Searches", MB_OK Or MB_ICONINFO
     LogStep "STEP 3: Starting Searches MsgBox dismissed -> proceeding to searches"
 
-    '--------------------------------------------------------------
-    ' STEP 4: Safety guard + runtime optimizations
-    '--------------------------------------------------------------
+    ' Bail out if the drive is dangerously full, then flip Excel into
+    ' its fast-mode (calc manual, no screen update, etc.).
     If Not CheckDiskSpace() Then Exit Sub
 
     AutoPrepareRuntime
     StartTime = Now
     LogStep "SEARCH PHASE start - total entities to process: " & (IIf(custName <> "", 1, 0) + totalCPs)
 
-    '--------------------------------------------------------------
-    ' STEP 5/6: Build ONE flat task queue across customer + all CPs
-    '           (v2.5.2 cross-entity batching: no tail-idle waste
-    '            between entities - workers always have work)
-    '--------------------------------------------------------------
+    ' Build one flat queue for the customer + every counterparty.
+    ' Keeping all tasks in a single pool means the workers never sit
+    ' idle waiting for the next entity's batch to start.
     Set allTasks = New Collection
     Application.StatusBar = "OSINT: Queueing searches..."
 
@@ -552,9 +478,8 @@ Sub SearchAndSavePDF_Direct()
         If bAbort Then GoTo AbortProcess
     End If
 
-    '--------------------------------------------------------------
-    ' STEP 7: Elapsed time + entity count (midnight-safe)
-    '--------------------------------------------------------------
+    ' Elapsed time - using DateDiff instead of subtraction so a run
+    ' that straddles midnight doesn't come out negative.
     ElapsedSeconds = DateDiff("s", StartTime, Now)
     Minutes = ElapsedSeconds \ 60
     Seconds = ElapsedSeconds Mod 60
@@ -567,12 +492,10 @@ Sub SearchAndSavePDF_Direct()
 
     entityCount = IIf(custName <> "" Or custNameNegNews <> "", 1, 0) + totalCPs
     ' actualSearchCount is the authoritative successful-PDF counter.
-    ' NO file-enum re-count (that was the v2.4.5 bug that returned 0
-    ' while OneDrive was still syncing).
+    ' We trust this over re-scanning the folder - OneDrive can lie
+    ' about what's on disk while a sync is still in flight.
 
-    '--------------------------------------------------------------
-    ' STEP 8: Local audit log
-    '--------------------------------------------------------------
+    ' Local audit log row.
     Set auditWs = GetOrCreateAuditSheet(ThisWorkbook)
     nextAuditRow = auditWs.Cells(auditWs.Rows.Count, "A").End(xlUp).Row + 1
     auditWs.Cells(nextAuditRow, 1).Value = Now
@@ -584,10 +507,8 @@ Sub SearchAndSavePDF_Direct()
     auditWs.Cells(nextAuditRow, 7).Value = TOOL_VERSION
     ThisWorkbook.Save
 
-    '--------------------------------------------------------------
-    ' STEP 9: Restore runtime + open folder IMMEDIATELY
-    '         (user sees PDFs while SharePoint push happens next)
-    '--------------------------------------------------------------
+    ' Give Excel its settings back and pop the folder open right away
+    ' so the analyst sees the PDFs while we push to SharePoint below.
     AutoRestoreRuntime
     Application.StatusBar = "OSINT: Opening folder and syncing to SharePoint..."
 
@@ -595,9 +516,9 @@ Sub SearchAndSavePDF_Direct()
     shell "explorer.exe """ & mainFolderPath & """", vbNormalFocus
     On Error GoTo ErrorHandler
 
-    '--------------------------------------------------------------
-    ' STEP 10: SharePoint master tracker push (with status bar updates)
-    '--------------------------------------------------------------
+    ' Push a row to the shared SharePoint tracker so the team can
+    ' see this run. Failures here are non-fatal - the local audit
+    ' log already has the authoritative record.
     Application.StatusBar = "OSINT: Pushing run to SharePoint master tracker..."
 
     For Each wb In Application.Workbooks
@@ -726,9 +647,8 @@ AbortProcess:
            vbInformation, "Canceled"
     GoTo CleanExit
 
-'------------------------------------------------------------------
-' GLOBAL ERROR HANDLER (Bucket 1 / A) - replaces silent GoTo CleanExit
-'------------------------------------------------------------------
+' Catch-all for anything unexpected. We log the error on the audit
+' sheet and show the analyst a dialog instead of dying silently.
 ErrorHandler:
     Dim errN As Long, errD As String, errS As String
     errN = Err.Number
@@ -782,10 +702,9 @@ CleanExit:
 
 End Sub
 
-'==================================================================
-' SAFETY GUARDS
-'==================================================================
-
+' Refuses to run if the user's drive is close to full. Batch PDF
+' runs can easily eat a few hundred MB and a half-written case
+' folder is worse than no folder at all.
 Private Function CheckDiskSpace() As Boolean
     On Error Resume Next
     Dim FSO As Object, drv As Object
@@ -813,17 +732,15 @@ Private Function CheckDiskSpace() As Boolean
     End If
 End Function
 
-'==================================================================
-' STATUS BAR - granular per-search updates (single-task path)
-'==================================================================
+' Small helper for the serial path - pokes the status bar so the
+' analyst can see which search is currently running.
 Private Sub SetSearchStatus(entityLabel As String, searchType As String)
     Application.StatusBar = "OSINT: " & entityLabel & " -> " & searchType & "..."
 End Sub
 
-'==================================================================
-' RUNTIME OPTIMIZER (AppLocker-safe)
-'==================================================================
-
+' Flips Excel into its fastest, least-distracting state while the
+' macro runs (no calc, no screen redraw, no dialogs) and saves
+' the original values so we can restore them on the way out.
 Public Sub AutoPrepareRuntime()
     On Error Resume Next
     If m_runtimeApplied Then Exit Sub
@@ -869,12 +786,9 @@ Public Sub AutoRestoreRuntime()
     On Error GoTo 0
 End Sub
 
-'------------------------------------------------------------------
-' Async DNS/TLS warmup - fired before user prompts (Bucket 2 / F).
-' We don't wait for the response. Connection + TLS session is
-' cached in the Windows socket pool, so the first real Edge search
-' skips most of the handshake.
-'------------------------------------------------------------------
+' Fires a throwaway HEAD request to Google so the DNS + TLS
+' handshake is already cached by the time Edge gets here. We fire
+' and forget - there's no point waiting for the response.
 Public Sub AutoPrewarmDNS()
     On Error Resume Next
     Dim http As Object
@@ -887,11 +801,9 @@ Public Sub AutoPrewarmDNS()
     On Error GoTo 0
 End Sub
 
-'------------------------------------------------------------------
-' Raise Excel to the foreground so the next InputBox/MsgBox shows
-' on top of everything. Cheap insurance against "invisible dialog"
-' hangs on locked-down VDIs.
-'------------------------------------------------------------------
+' Nudge Excel to the top so the next InputBox / MsgBox isn't hidden
+' behind something. Cheap insurance against the classic VDI bug
+' where a prompt shows up off-screen and the macro looks frozen.
 Private Sub ForcePromptToFront()
     On Error Resume Next
     AppActivate Application.Caption
@@ -899,13 +811,10 @@ Private Sub ForcePromptToFront()
     On Error GoTo 0
 End Sub
 
-'------------------------------------------------------------------
-' Direct Win32 MessageBoxW call with MB_TOPMOST + MB_SETFOREGROUND.
-' VBA's MsgBox (even with vbSystemModal) is unreliable on Citrix/VDI
-' because the VDI compositor owns the z-order. Calling MessageBoxW
-' directly sidesteps the VBA wrapper entirely.
-' Returns IDOK / IDYES / IDNO (Win32 codes).
-'------------------------------------------------------------------
+' Direct Win32 MessageBoxW call with TOPMOST + SETFOREGROUND.
+' VBA's own MsgBox (even with vbSystemModal) loses the z-order
+' fight on Citrix / V2 Cloud, so we go around it and talk to
+' user32 directly. Returns Win32 IDOK / IDYES / IDNO.
 Private Function TopMostMsgBox(ByVal msg As String, _
                                ByVal title As String, _
                                ByVal flags As Long) As Long
@@ -943,8 +852,8 @@ Public Sub LogStep(ByVal msg As String)
 End Sub
 
 Public Function BuildEdgeArgs(ByVal url As String) As String
-    ' Used by INTERACTIVE fallback mode (USE_HEADLESS = False).
-    ' V2 Cloud / Xen / AMD EPYC / no-GPU optimized.
+    ' Only the interactive fallback (USE_HEADLESS = False) uses this.
+    ' Flags picked to play nicely with V2 Cloud's no-GPU environment.
     BuildEdgeArgs = _
         "--disable-gpu --disable-gpu-compositing --disable-software-rasterizer " & _
         "--disable-background-timer-throttling --disable-renderer-backgrounding " & _
@@ -955,18 +864,20 @@ Public Function BuildEdgeArgs(ByVal url As String) As String
         "--lang=en-US """ & url & """"
 End Function
 
-'==================================================================
-' PARALLEL SEARCH DISPATCH (Bucket 3, v2.5.2 with cross-entity batching + CAPTCHA retry)
-'==================================================================
-
-' Runs a flat collection of search tasks.
-' Each task is Array(query, savePath, pageNum, description, entityLabel).
-' In headless mode: up to MAX_PARALLEL concurrent msedge.exe across
-' ALL tasks (cross-entity); workers never sit idle between entities.
-' Small PDFs (possible CAPTCHAs) get one automatic retry after a 15s
-' cooldown, using the same worker pool.
-' In interactive mode: serial (one at a time).
-' Returns the count of tasks that produced a valid PDF on disk.
+' ============================ Search engine ============================
+'
+' Runs a flat collection of search tasks. Each task is
+' Array(query, savePath, pageNum, description, entityLabel).
+'
+' In headless mode we keep up to MAX_PARALLEL Edge processes busy at
+' once across the whole batch - there's no per-entity boundary, so
+' workers are never idle while some other entity's tasks are still
+' queued. Anything that comes back suspiciously small (probably a
+' CAPTCHA) gets one automatic retry after a brief cool-down.
+'
+' In interactive mode we just run them one at a time.
+'
+' Returns the number of tasks that produced a valid PDF on disk.
 Private Function RunSearchBatch(tasks As Collection, wsh As Object) As Long
     If tasks Is Nothing Then Exit Function
     If tasks.Count = 0 Then Exit Function
@@ -987,21 +898,16 @@ Private Function RunSearchBatchParallel(tasks As Collection, wsh As Object) As L
     Dim batchStartT As Single: batchStartT = Timer
     LogStep "BATCH ALL start, n=" & n & ", maxParallel=" & MAX_PARALLEL
 
-    ' ---------- Pass 1: initial dispatch ----------
+    ' First pass: run every task through the worker pool.
     Dim initialSizes() As Long
     DispatchTaskPass tasks, wsh, "initial", initialSizes, False, TASK_TIMEOUT_SEC
 
-    ' Build retry collection from tasks that produced a suspiciously
-    ' small PDF (valid-ish size, but probably a CAPTCHA page).
+    ' Look at what came back. A task earns a retry only if it really
+    ' looks broken - either no file at all (crash or timeout) or a
+    ' suspiciously tiny one (CAPTCHA / interstitial). A normal Google
+    ' SERP PDF is comfortably over CAPTCHA_SIZE_HINT.
     Dim retryList As Collection
     Set retryList = New Collection
-
-    ' v2.5.4: retry ONLY real failures, not every small-but-valid PDF.
-    ' Two retry conditions:
-    '   (a) file missing or empty (size = 0) -> timeout / Edge crash
-    '   (b) MIN < size < CAPTCHA_HINT       -> stub or CAPTCHA page
-    ' A normal Google SERP PDF is 150-500 KB so the upper threshold
-    ' (CAPTCHA_SIZE_HINT = 150 KB) flags only suspicious small pages.
     Dim i As Long, a As Variant
     For i = 1 To n
         If i <= UBound(initialSizes) Then
@@ -1014,13 +920,13 @@ Private Function RunSearchBatchParallel(tasks As Collection, wsh As Object) As L
         End If
     Next i
 
-    ' ---------- Pass 2: CAPTCHA retry after cooldown ----------
+    ' Second pass: short cooldown, then retry the bad ones.
     If retryList.Count > 0 And Not bAbort Then
         LogStep "CAPTCHA COOLDOWN: " & retryList.Count & _
                 " tasks flagged - waiting " & RETRY_COOLDOWN_SEC & "s before retry"
         Application.StatusBar = "OSINT: CAPTCHA cooldown (" & retryList.Count & _
                                 " tasks) - waiting " & RETRY_COOLDOWN_SEC & "s before retry..."
-        SmartWait RETRY_COOLDOWN_SEC, False  ' ESC still works during cooldown
+        SmartWait RETRY_COOLDOWN_SEC, False
 
         If Not bAbort Then
             Dim retrySizes() As Long
@@ -1046,7 +952,8 @@ Private Function RunSearchBatchParallel(tasks As Collection, wsh As Object) As L
         DispatchTaskPass rescueList, wsh, "rescue", rescueSizes, True, RETRY_TIMEOUT_SEC
     End If
 
-    ' ---------- Final count: actual valid PDFs on disk ----------
+    ' Final tally is taken straight from disk - that way any of the
+    ' three passes getting the file to a good state gets counted.
     Dim finalSuccess As Long
     For i = 1 To n
         a = tasks(i)
@@ -1063,11 +970,15 @@ Private Function RunSearchBatchParallel(tasks As Collection, wsh As Object) As L
     RunSearchBatchParallel = finalSuccess
 End Function
 
-' Single-pass parallel dispatch over a tasks collection.
-' Fills finalSizes(1..n) with the on-disk size after each task completes
-' (0 if failed/timed out). Caller uses this to decide whether to retry.
-' preserveExisting: if True (retry pass), do NOT delete the existing
-' file before re-running - so if Edge fails we keep the borderline PDF.
+' Runs one pass over a task list using the parallel worker pool.
+' Fills finalSizes(1..n) with the size each task's PDF ends up at
+' on disk, so the caller can decide if a retry is warranted.
+'
+' When preserveExisting is True (used on retry / rescue passes) we
+' don't delete the existing PDF before relaunching Edge - instead
+' we rename it to a .retrybak sidecar. If the retry produces a
+' good file we drop the backup; if it fails we put the old file
+' back. That way we never regress a file that was already working.
 Private Sub DispatchTaskPass(tasks As Collection, _
                              wsh As Object, _
                              ByVal passLabel As String, _
@@ -1078,7 +989,7 @@ Private Sub DispatchTaskPass(tasks As Collection, _
 
     Dim n As Long: n = tasks.Count
     If n = 0 Then
-        ReDim finalSizes(1 To 1)  ' avoid uninitialised-array issues in caller
+        ReDim finalSizes(1 To 1)   ' guard against uninitialised array in caller
         Exit Sub
     End If
 
@@ -1086,17 +997,38 @@ Private Sub DispatchTaskPass(tasks As Collection, _
     Dim dsc() As String, lbl() As String
     If timeoutSeconds <= 0 Then timeoutSeconds = TASK_TIMEOUT_SEC
 
-    Dim st() As Long         ' 0=pending, 1=running, 2=done, 3=failed
+    ' Per-task bookkeeping:
+    '   st         - 0 pending / 1 running / 2 done / 3 failed
+    '   launchT    - when we kicked Edge off
+    '   firstSeenT - when the PDF first appeared on disk with any bytes
+    '   wk         - which worker slot the task is using
+    '   bak        - path of the preserved old PDF, if any
+    '   lastSize / stableHits - watch the file size settle before we
+    '                           call the task done, so we never catch
+    '                           Edge mid-write and mark a partial PDF.
+    '   durSecArr  - captured duration per task for the end-of-pass stats.
+    Dim st() As Long
     Dim launchT() As Date
+    Dim firstSeenT() As Date
     Dim wk() As Long
     Dim bak() As String
     Dim hadBackup() As Boolean
     Dim lastSize() As Long
     Dim stableHits() As Long
+    Dim durSecArr() As Long
     ReDim qry(1 To n), pth(1 To n), pg(1 To n), dsc(1 To n), lbl(1 To n)
-    ReDim st(1 To n), launchT(1 To n), wk(1 To n)
+    ReDim st(1 To n), launchT(1 To n), firstSeenT(1 To n), wk(1 To n)
     ReDim bak(1 To n), hadBackup(1 To n), lastSize(1 To n), stableHits(1 To n)
+    ReDim durSecArr(1 To n)
     ReDim finalSizes(1 To n)
+
+    ' Track how much of the pass each worker was actually busy -
+    ' lets us spot a lone worker holding up the whole batch at the tail.
+    Dim workerBusyT() As Date
+    Dim workerBusySec() As Long
+    ReDim workerBusyT(0 To MAX_PARALLEL - 1)
+    ReDim workerBusySec(0 To MAX_PARALLEL - 1)
+    Dim queueStartT As Date: queueStartT = Now
 
     Dim i As Long, a As Variant
     For i = 1 To n
@@ -1148,6 +1080,7 @@ Private Sub DispatchTaskPass(tasks As Collection, _
 
                         st(i) = 1
                         launchT(i) = Now
+                        workerBusyT(w) = Now         ' worker utilisation clock starts
                         wk(i) = w
                         busy(w) = True
                         runningCount = runningCount + 1
@@ -1175,6 +1108,13 @@ Private Sub DispatchTaskPass(tasks As Collection, _
                     On Error GoTo Fail
                 End If
 
+                ' Remember the moment the PDF first shows up with any
+                ' bytes - that's our proxy for Edge having finished
+                ' booting and navigated to the SERP.
+                If sz > 0 And firstSeenT(i) = #12:00:00 AM# Then
+                    firstSeenT(i) = Now
+                End If
+
                 If sz > MIN_PDF_SIZE_BYTES Then
                     If sz = lastSize(i) Then
                         stableHits(i) = stableHits(i) + 1
@@ -1192,10 +1132,27 @@ Private Sub DispatchTaskPass(tasks As Collection, _
                     runningCount = runningCount - 1
                     busy(wk(i)) = False
                     taskDurSec = DateDiff("s", launchT(i), Now)
+                    durSecArr(i) = taskDurSec
+                    workerBusySec(wk(i)) = workerBusySec(wk(i)) + _
+                                           DateDiff("s", workerBusyT(wk(i)), Now)
                     currLabel = lbl(i)
 
+                    ' Slice total duration into wait / Edge-start / render
+                    ' so the log tells us which phase ate the time.
+                    Dim edgeStartSec As Long, renderSec As Long, waitSec As Long
+                    waitSec = DateDiff("s", queueStartT, launchT(i))
+                    If firstSeenT(i) <> #12:00:00 AM# Then
+                        edgeStartSec = DateDiff("s", launchT(i), firstSeenT(i))
+                        renderSec = DateDiff("s", firstSeenT(i), Now)
+                    Else
+                        edgeStartSec = -1
+                        renderSec = -1
+                    End If
+
                     LogStep "  TASK done  [" & i & "/" & n & "] w" & wk(i) & _
-                            " dur=" & taskDurSec & "s size=" & sz & "B running=" & runningCount
+                            " wait=" & waitSec & "s edgeStart=" & edgeStartSec & _
+                            "s render=" & renderSec & "s dur=" & taskDurSec & _
+                            "s size=" & sz & "B running=" & runningCount
 
                     If hadBackup(i) Then
                         On Error Resume Next
@@ -1214,6 +1171,9 @@ Private Sub DispatchTaskPass(tasks As Collection, _
                     doneCount = doneCount + 1
                     runningCount = runningCount - 1
                     busy(wk(i)) = False
+                    workerBusySec(wk(i)) = workerBusySec(wk(i)) + _
+                                           DateDiff("s", workerBusyT(wk(i)), Now)
+                    durSecArr(i) = DateDiff("s", launchT(i), Now)
                     KillEdgeWorkerProcesses wk(i)
                     If hadBackup(i) Then
                         On Error Resume Next
@@ -1222,8 +1182,20 @@ Private Sub DispatchTaskPass(tasks As Collection, _
                         If Dir(pth(i)) <> "" Then finalSizes(i) = FileLen(pth(i))
                         On Error GoTo Fail
                     End If
+
+                    ' Note whether Edge ever wrote anything. If not,
+                    ' the hang was at launch / navigation; if yes, the
+                    ' hang was during render or PDF write.
+                    Dim fileState As String
+                    If firstSeenT(i) = #12:00:00 AM# Then
+                        fileState = "NO FILE EVER"
+                    Else
+                        fileState = "file seen after " & _
+                                    DateDiff("s", launchT(i), firstSeenT(i)) & "s"
+                    End If
                     LogStep "  TASK TIMEOUT [" & i & "/" & n & "] w" & wk(i) & _
-                            " after " & timeoutSeconds & "s - [" & lbl(i) & "] " & dsc(i)
+                            " after " & timeoutSeconds & "s (" & fileState & _
+                            ") - [" & lbl(i) & "] " & dsc(i)
                 End If
 ContinuePollingTask:
             End If
@@ -1242,8 +1214,44 @@ ContinuePollingTask:
         SmartWait T(POLL_INTERVAL_SEC)
     Loop While doneCount < n
 
+    ' End-of-pass stats: how were the task durations distributed,
+    ' and how saturated was each worker?
+    Dim passWallSec As Long: passWallSec = CLng(Timer - passStartT)
+    Dim minD As Long, maxD As Long, sumD As Long, countD As Long
+    Dim b0_10 As Long, b10_20 As Long, b20_30 As Long, b30_45 As Long, b45_60 As Long, b60p As Long
+    minD = 99999
+    For i = 1 To n
+        If durSecArr(i) > 0 Then
+            countD = countD + 1
+            sumD = sumD + durSecArr(i)
+            If durSecArr(i) < minD Then minD = durSecArr(i)
+            If durSecArr(i) > maxD Then maxD = durSecArr(i)
+            Select Case durSecArr(i)
+                Case Is < 10:  b0_10 = b0_10 + 1
+                Case Is < 20:  b10_20 = b10_20 + 1
+                Case Is < 30:  b20_30 = b20_30 + 1
+                Case Is < 45:  b30_45 = b30_45 + 1
+                Case Is < 60:  b45_60 = b45_60 + 1
+                Case Else:     b60p = b60p + 1
+            End Select
+        End If
+    Next i
+    If countD = 0 Then minD = 0
+
     LogStep "PASS [" & passLabel & "] end, success=" & successCount & "/" & n & _
-            " wall=" & CLng(Timer - passStartT) & "s"
+            " wall=" & passWallSec & "s"
+    If countD > 0 Then
+        LogStep "  DIST [" & passLabel & "] min=" & minD & "s avg=" & (sumD \ countD) & _
+                "s max=" & maxD & "s | <10s=" & b0_10 & " <20s=" & b10_20 & _
+                " <30s=" & b20_30 & " <45s=" & b30_45 & " <60s=" & b45_60 & _
+                " 60+s=" & b60p
+    End If
+    For w = 0 To MAX_PARALLEL - 1
+        Dim utilPct As Long
+        If passWallSec > 0 Then utilPct = (workerBusySec(w) * 100) \ passWallSec
+        LogStep "  UTIL w" & w & " busy=" & workerBusySec(w) & "s/" & passWallSec & _
+                "s = " & utilPct & "%"
+    Next w
     Exit Sub
 Fail:
     LogStep "PASS [" & passLabel & "] FAIL err=" & Err.Number & " desc=" & Err.Description
@@ -1270,10 +1278,10 @@ Private Function RunSearchBatchSerial(tasks As Collection, wsh As Object) As Lon
     RunSearchBatchSerial = successCount
 End Function
 
-'==================================================================
-' SEARCH ENGINE
-'==================================================================
-
+' ---- Single-task search helpers ----
+' Used by the interactive fallback path and anywhere else we just
+' want to run one search synchronously. The parallel dispatcher
+' above drives Edge directly.
 Function PrintSearchToPDF(Query As String, savePath As String, wsh As Object, _
                           Optional PageNum As Long = 1) As Boolean
     If USE_HEADLESS Then
@@ -1283,10 +1291,9 @@ Function PrintSearchToPDF(Query As String, savePath As String, wsh As Object, _
     End If
 End Function
 
-'------------------------------------------------------------------
-' HEADLESS MODE - single-task (kept for compatibility + interactive fallback).
-' Parallel dispatch calls BuildHeadlessEdgeCmd directly with per-worker idx.
-'------------------------------------------------------------------
+' Synchronous single-shot headless run. Only used by the fallback
+' paths - the parallel dispatcher talks to Edge directly so it
+' can keep several workers busy at once.
 Private Function PrintSearchToPDF_Headless(Query As String, _
                                            savePath As String, _
                                            ByVal PageNum As Long, _
@@ -1319,11 +1326,10 @@ FuncFail:
     PrintSearchToPDF_Headless = False
 End Function
 
-'------------------------------------------------------------------
-' Build headless Edge command line.
-' workerIdx selects --user-data-dir, so 3 parallel processes get
-' 3 independent profile locks instead of fighting for one.
-'------------------------------------------------------------------
+' Builds the command line for one headless Edge instance.
+' workerIdx picks a unique --user-data-dir so parallel Edge
+' processes each have their own profile and don't fight over
+' a single profile lock.
 Private Function BuildHeadlessEdgeCmd(ByVal Query As String, _
                                       ByVal savePath As String, _
                                       ByVal PageNum As Long, _
@@ -1340,16 +1346,9 @@ Private Function BuildHeadlessEdgeCmd(ByVal Query As String, _
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " & _
          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
 
-    ' v2.5.1: stripped back to match v2.4.5 + only safe micro-optimizations.
-    ' Removed (were hurting perf or had zero benefit):
-    '   --disable-features=...,VizDisplayCompositor,...  (forces slow
-    '     legacy rasterizer - primary perf regression vs v2.4.5)
-    '   --disable-breakpad, --disable-translate,
-    '   --disable-ipc-flooding-protection, --disable-hang-monitor
-    '     (marginal or negative impact)
-    ' Kept: the v2.4.5 baseline + audio/scrollbars/pings/sync/
-    ' component-update/default-apps/metrics/phishing (all safe).
-    ' --no-pdf-header-footer OMITTED on purpose (keep default headers).
+    ' Flag set tuned for a no-GPU VDI. Headers/footers are left
+    ' enabled on purpose so the PDF shows the date, URL and page
+    ' number for audit.
     s = """" & edgeExe & """"
     s = s & " --headless=new"
     s = s & " --disable-gpu"
@@ -1370,9 +1369,6 @@ Private Function BuildHeadlessEdgeCmd(ByVal Query As String, _
     s = s & " --mute-audio"
     s = s & " --hide-scrollbars"
     s = s & " --no-pings"
-    ' v2.5.4: virtual-time-budget REMOVED again. On Google SERP it was
-    ' truncating layout at 10s -> small PDFs -> every task retried ->
-    ' ~6 min runs. v2.4.5 worked fine without it.
     s = s & " --print-to-pdf=""" & savePath & """"
     s = s & " """ & baseURL & """"
 
@@ -1383,15 +1379,11 @@ Private Function GetWorkerProfilePath(ByVal workerIdx As Long) As String
     GetWorkerProfilePath = Environ("LOCALAPPDATA") & "\OSINT_EdgeWorker_" & workerIdx
 End Function
 
-'------------------------------------------------------------------
-' v2.5.6: kill any msedge.exe instance whose command line references
-' OSINT_EdgeWorker_<idx>. Used after a TASK TIMEOUT to free the
-' worker profile lock so the next task can launch on the same slot
-' without colliding with a still-alive headless process.
-'
-' Uses WMI (winmgmts) which is allowed on locked-down VDIs without
-' admin rights. Fails silent if WMI is blocked.
-'------------------------------------------------------------------
+' Kill any msedge.exe whose command line references
+' OSINT_EdgeWorker_<idx>. Called after a timeout so the worker's
+' user-data-dir lock is released and the next task can re-use the
+' slot cleanly. Uses WMI, which is available on locked-down VDIs
+' without admin rights; if WMI is blocked we just fall through.
 Private Sub KillEdgeWorkerProcesses(ByVal workerIdx As Long)
     On Error Resume Next
     Dim wmi As Object, procs As Object, p As Object
@@ -1592,10 +1584,7 @@ FuncFail:
     PrintSearchToPDF_Interactive = False
 End Function
 
-'==================================================================
-' WINDOW / SENDKEYS HELPERS
-'==================================================================
-
+' ---- Window / SendKeys helpers (interactive fallback only) ----
 #If VBA7 Then
 Private Sub ForceForeground(ByVal hTarget As LongPtr)
 #Else
@@ -1638,10 +1627,9 @@ Sub SafeCloseBrowserTab(wsh As Object)
     Application.EnableCancelKey = xlInterrupt
 End Sub
 
-'==================================================================
-' CLIPBOARD (validation + fallback)
-'==================================================================
-
+' Put text on the clipboard and verify it stuck. Some VDIs lose
+' clipboard writes silently, so we read the value back; if that
+' fails, we fall through to the htmlfile/IE trick as a backup.
 Sub CopyToClipboard(ByVal Text As String)
     Dim objData As Object, verifyText As String
     Dim clipboardSet As Boolean: clipboardSet = False
@@ -1670,10 +1658,7 @@ Sub CopyToClipboard(ByVal Text As String)
     Set objData = Nothing
 End Sub
 
-'==================================================================
-' DATA HELPERS
-'==================================================================
-
+' ---- Small string / data helpers ----
 Function URLEncode(ByVal Text As String) As String
     Dim i As Long, Char As String, EncodedText As String
     EncodedText = ""
@@ -1685,7 +1670,9 @@ Function URLEncode(ByVal Text As String) As String
             Case 32
                 EncodedText = EncodedText & "+"
             Case Else
-                ' Zero-padded hex per RFC 3986 (Bucket 2 / J)
+                ' Zero-pad hex so single-digit byte values stay
+                ' two characters wide (%0A, not %A). Some servers
+                ' choke on the unpadded form.
                 EncodedText = EncodedText & "%" & Right("0" & Hex(Asc(Char)), 2)
         End Select
     Next i
@@ -1715,9 +1702,11 @@ Function SanitizeFileNamePart(ByVal Text As String) As String
 End Function
 
 Private Function NormalizeSpaces(ByVal Text As String) As String
-    ' Collapses runs of whitespace into a single space.
-    ' Different from SanitizeFileNamePart - no char stripping.
-    ' Bounded For loop instead of Do While so we can never hang.
+    ' Collapse runs of whitespace into a single space. Unlike
+    ' SanitizeFileNamePart this doesn't strip any characters - it
+    ' just normalises spacing so "John  Smith" becomes "John Smith".
+    ' We use a bounded For loop instead of Do While so there is no
+    ' chance of an infinite loop on weird input.
     LogStep "  NormalizeSpaces entry, inLen=" & Len(Text)
     On Error Resume Next
     Text = Replace(Text, Chr(9), " ")      ' tab
@@ -1771,7 +1760,7 @@ Private Function GetOrCreateAuditSheet(wb As Workbook) As Worksheet
         ws.Cells(1, 5).Value = "Total Searches"
         ws.Cells(1, 6).Value = "Time Taken"
         ws.Cells(1, 7).Value = "Tool Version"
-        ws.Cells(1, 8).Value = "Error Diagnostic"   ' Bucket 1 / A
+        ws.Cells(1, 8).Value = "Error Diagnostic"
         With ws.Range("A1:H1")
             .Font.Bold = True
             .Interior.Color = RGB(0, 70, 127)
@@ -1780,7 +1769,8 @@ Private Function GetOrCreateAuditSheet(wb As Workbook) As Worksheet
         ws.Columns("A:H").AutoFit
     End If
 
-    ' Backfill col H header on older audit sheets (non-destructive)
+    ' Back-fill the Error Diagnostic header on older sheets that
+    ' pre-date it. Non-destructive - we only write if empty.
     If ws.Cells(1, 8).Value = "" Then
         ws.Cells(1, 8).Value = "Error Diagnostic"
         With ws.Range("H1")
@@ -1793,10 +1783,9 @@ Private Function GetOrCreateAuditSheet(wb As Workbook) As Worksheet
     Set GetOrCreateAuditSheet = ws
 End Function
 
-'==================================================================
-' TIMING
-'==================================================================
-
+' TIMING_PROFILE scales every internal wait by a single factor so
+' we can dial things tighter on a fast machine or looser on a
+' struggling VDI without touching individual sleep calls.
 Private Function T(BaseSeconds As Single) As Single
     Select Case TIMING_PROFILE
         Case "FAST": T = BaseSeconds * 0.7
@@ -1805,6 +1794,9 @@ Private Function T(BaseSeconds As Single) As Single
     End Select
 End Function
 
+' DoEvents-friendly sleep. Keeps Excel responsive, listens for the
+' ESC key so the analyst can cancel, and survives a midnight
+' rollover (Timer resets to 0 after 86 400 seconds).
 Sub SmartWait(Seconds As Single, Optional IgnoreESC As Boolean = False)
     Dim EndTime As Single
     EndTime = Timer + Seconds
@@ -1816,9 +1808,9 @@ Sub SmartWait(Seconds As Single, Optional IgnoreESC As Boolean = False)
                 Exit Sub
             End If
         End If
-        ' Midnight rollover guard
         If Timer < EndTime - 86000 Then EndTime = EndTime - 86400
     Loop
 
-    If IgnoreESC Then GetAsyncKeyState 27   ' drain buffered ESC
+    ' Drain any ESC presses we swallowed while ignoring them.
+    If IgnoreESC Then GetAsyncKeyState 27
 End Sub
