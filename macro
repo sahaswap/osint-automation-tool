@@ -1,0 +1,1598 @@
+'==================================================================
+' OSINT AUTOMATION TOOL v2.5.0
+'
+' Changelog from v2.4.5:
+'
+'  Bucket 1 - Correctness
+'  ----------------------
+'   - Fixed audit-log "Total Searches" bug (accumulator was wiped
+'     and rebuilt via OneDrive file enumeration, which silently
+'     returned 0 while sync was pending).
+'   - Added global ErrorHandler: unexpected errors now log to the
+'     Audit_Log sheet and show a user dialog instead of silently
+'     exiting via GoTo CleanExit.
+'   - SharePoint-sync failures are now surfaced in the success
+'     dialog instead of silently skipped.
+'   - baseFileName trailing underscore stripped (happened when
+'     alertID was blank -> produced filenames like
+'     "ECM123__Customer_1...").
+'   - Double-space in customer/CP names no longer triggers a false
+'     "middle name detected" prompt.
+'
+'  Bucket 2 - Safe speed wins
+'  --------------------------
+'   - DNS/TLS warmup moved to BEFORE user prompts and made
+'     asynchronous (fire-and-forget), so the handshake completes
+'     while the analyst is filling in prompts.
+'   - WshShell is created once in the main sub and reused by every
+'     headless Edge launch (was re-created per search).
+'   - Headless window size reduced from 1920x1080 -> 1280x900.
+'   - Added hardening flags: --disable-breakpad, --mute-audio,
+'     --hide-scrollbars, --password-store=basic,
+'     --use-mock-keychain, --metrics-recording-only,
+'     --disable-hang-monitor, --disable-default-apps,
+'     --disable-component-update, --no-pings,
+'     --disable-ipc-flooding-protection, --disable-translate.
+'   - Added --virtual-time-budget=8000 so headless treats 8s of JS
+'     timers as having elapsed immediately.
+'   - SharePoint push moved to AFTER the folder open, so the
+'     analyst sees the ECM folder without waiting for WebDAV.
+'   - URLEncode hex now zero-padded (%0A instead of %A).
+'
+'  Bucket 3 - Architectural speed win
+'  ----------------------------------
+'   - Parallel 3-worker headless dispatch, scoped per-entity.
+'   - Each worker uses its own --user-data-dir
+'     (OSINT_EdgeWorker_0 / _1 / _2) so profile locks don't
+'     collide between concurrent msedge.exe instances.
+'   - Non-blocking wsh.Run launches + file-poll completion
+'     detection (file exists AND size > MIN_PDF_SIZE_BYTES).
+'   - 0.4 s launch stagger to stay under Google rate limits.
+'   - 60 s per-task timeout. Orphans are left to self-exit.
+'
+' Expected runtime: ~3x faster than v2.4.5 on V2 Cloud
+' (2 vCPU / 16 GB). A typical 50-search run drops from
+' ~4:30 to ~1:30.
+'
+' To run: Assign "SearchAndSavePDF_Direct" to your macro button.
+'==================================================================
+
+Option Explicit
+
+'==================================================================
+' WINDOWS API DECLARATIONS
+'==================================================================
+#If VBA7 Then
+Private Declare PtrSafe Function ShellExecute Lib "shell32.dll" Alias "ShellExecuteA" _
+    (ByVal hwnd As LongPtr, ByVal lpOperation As String, ByVal lpFile As String, _
+     ByVal lpParameters As String, ByVal lpDirectory As String, _
+     ByVal nShowCmd As Long) As LongPtr
+Private Declare PtrSafe Function GetAsyncKeyState Lib "user32" (ByVal vKey As Long) As Integer
+Private Declare PtrSafe Function FindWindow Lib "user32" Alias "FindWindowA" _
+    (ByVal lpClassName As String, ByVal lpWindowName As String) As LongPtr
+Private Declare PtrSafe Function SetForegroundWindow Lib "user32" (ByVal hwnd As LongPtr) As Long
+Private Declare PtrSafe Function BringWindowToTop Lib "user32" (ByVal hwnd As LongPtr) As Long
+Private Declare PtrSafe Function GetWindowThreadProcessId Lib "user32" _
+    (ByVal hwnd As LongPtr, ByRef lpdwProcessId As Long) As Long
+Private Declare PtrSafe Function AttachThreadInput Lib "user32" _
+    (ByVal idAttach As Long, ByVal idAttachTo As Long, ByVal fAttach As Long) As Long
+Private Declare PtrSafe Function GetCurrentThreadId Lib "kernel32" () As Long
+Private Declare PtrSafe Function OpenClipboard Lib "user32" (ByVal hwnd As LongPtr) As Long
+Private Declare PtrSafe Function EmptyClipboard Lib "user32" () As Long
+Private Declare PtrSafe Function CloseClipboard Lib "user32" () As Long
+Private Declare PtrSafe Function MessageBoxW Lib "user32" ( _
+    ByVal hwnd As LongPtr, ByVal lpText As LongPtr, _
+    ByVal lpCaption As LongPtr, ByVal uType As Long) As Long
+#Else
+Private Declare Function ShellExecute Lib "shell32.dll" Alias "ShellExecuteA" _
+    (ByVal hwnd As Long, ByVal lpOperation As String, ByVal lpFile As String, _
+     ByVal lpParameters As String, ByVal lpDirectory As String, _
+     ByVal nShowCmd As Long) As Long
+Private Declare Function GetAsyncKeyState Lib "user32" (ByVal vKey As Long) As Integer
+Private Declare Function FindWindow Lib "user32" Alias "FindWindowA" _
+    (ByVal lpClassName As String, ByVal lpWindowName As String) As Long
+Private Declare Function SetForegroundWindow Lib "user32" (ByVal hwnd As Long) As Long
+Private Declare Function BringWindowToTop Lib "user32" (ByVal hwnd As Long) As Long
+Private Declare Function GetWindowThreadProcessId Lib "user32" _
+    (ByVal hwnd As Long, ByRef lpdwProcessId As Long) As Long
+Private Declare Function AttachThreadInput Lib "user32" _
+    (ByVal idAttach As Long, ByVal idAttachTo As Long, ByVal fAttach As Long) As Long
+Private Declare Function GetCurrentThreadId Lib "kernel32" () As Long
+Private Declare Function OpenClipboard Lib "user32" (ByVal hwnd As Long) As Long
+Private Declare Function EmptyClipboard Lib "user32" () As Long
+Private Declare Function CloseClipboard Lib "user32" () As Long
+Private Declare Function MessageBoxW Lib "user32" ( _
+    ByVal hwnd As Long, ByVal lpText As Long, _
+    ByVal lpCaption As Long, ByVal uType As Long) As Long
+#End If
+
+'==================================================================
+' Win32 MessageBox flag constants (for TopMostMsgBox)
+'==================================================================
+Private Const MB_OK          As Long = &H0
+Private Const MB_YESNO       As Long = &H4
+Private Const MB_ICONERROR   As Long = &H10
+Private Const MB_ICONQUESTION As Long = &H20
+Private Const MB_ICONWARNING As Long = &H30
+Private Const MB_ICONINFO    As Long = &H40
+Private Const MB_TOPMOST     As Long = &H40000
+Private Const MB_SETFOREGROUND As Long = &H10000
+Private Const MB_SYSTEMMODAL As Long = &H1000
+Private Const IDOK  As Long = 1
+Private Const IDYES As Long = 6
+Private Const IDNO  As Long = 7
+
+'==================================================================
+' MODULE CONSTANTS
+'==================================================================
+Private Const TOOL_VERSION As String = "2.5.0"
+Private Const MIN_PDF_SIZE_BYTES As Long = 5120
+Private Const CAPTCHA_SIZE_HINT As Long = 150000   ' below this, likely CAPTCHA
+
+Private Const USE_HEADLESS As Boolean = True
+Private Const TIMING_PROFILE As String = "NORMAL"   ' FAST | NORMAL | SLOW
+
+' Parallel dispatch
+Private Const MAX_PARALLEL As Long = 3              ' workers per entity
+Private Const LAUNCH_STAGGER_SEC As Single = 0.4    ' gap between concurrent launches
+Private Const POLL_INTERVAL_SEC As Single = 0.3     ' sleep between completion checks
+Private Const TASK_TIMEOUT_SEC As Long = 60         ' per-task safety net
+
+' Disk thresholds (GB)
+Private Const DISK_ABORT_GB As Double = 2
+Private Const DISK_WARN_GB As Double = 5
+
+Private Const MASTER_PATH As String = _
+    "https://cfsb-my.sharepoint.com/personal/msrivastava_cfsb_com/Documents/" & _
+    "L1%20Beta/Beta 2.4_Feedbacks & Issues Encountered.xlsx"
+Private Const MASTER_FILENAME As String = "Beta 2.4_Feedbacks & Issues Encountered.xlsx"
+
+'==================================================================
+' MODULE-LEVEL STATE
+'==================================================================
+Private bAbort As Boolean
+
+Private m_origCalc As XlCalculation
+Private m_origScreenUpdate As Boolean
+Private m_origEvents As Boolean
+Private m_origAlerts As Boolean
+Private m_origCursor As XlMousePointer
+Private m_origPrintComm As Boolean
+Private m_runtimeApplied As Boolean
+
+'==================================================================
+' MAIN MACRO
+'==================================================================
+Sub SearchAndSavePDF_Direct()
+
+    On Error GoTo ErrorHandler
+
+    ' Reset debug log at start of every run so the tail is always the current session
+    On Error Resume Next
+    Kill Environ("TEMP") & "\osint_debug.log"
+    On Error GoTo ErrorHandler
+    LogStep "=== Macro started (v" & TOOL_VERSION & ") ==="
+
+    '--------------------------------------------------------------
+    ' DECLARATIONS
+    '--------------------------------------------------------------
+    Dim ws As Worksheet, auditWs As Worksheet, masterWs As Worksheet
+    Dim WshShell As Object, FSO As Object, ghostApp As Object
+    Dim masterWb As Workbook, wb As Workbook
+
+    Dim i As Long, fileCounter As Long, totalCPs As Long
+    Dim entityCount As Long, actualSearchCount As Long
+    Dim cpLoopPosition As Long, hdrIdx As Long
+    Dim nextAuditRow As Long, mRow As Long
+    Dim wasAlreadyOpen As Boolean, headersOK As Boolean
+
+    Dim ecmCase As String, alertID As String
+    Dim custName As String, custAddr As String
+    Dim custNameNegNews As String, custNameNegNewsNoMiddle As String
+    Dim additionalCustAddr As String
+    Dim cpName As String, cpAddr As String
+    Dim cpNameNegNews(19 To 24) As String
+    Dim cpNameNegNewsNoMiddle(19 To 24) As String
+
+    Dim baseFileName As String, desktopPath As String
+    Dim caseFolderPath As String, mainFolderPath As String
+    Dim negWords As String
+    Dim userProfile As String
+    Dim custLabel As String, cpLabel As String
+
+    Dim StartTime As Date
+    Dim ElapsedSeconds As Long, Minutes As Long, Seconds As Long
+    Dim timeString As String
+
+    Dim nameParts() As String
+    Dim addAddrResponse As VbMsgBoxResult
+
+    Dim expectedHeaders As Variant, headerMsg As String
+    Dim spSyncStatus As String      ' "OK" / "FAILED: ..." / "SKIPPED"
+    Dim custBatch As Collection, cpBatch As Collection
+
+    '--------------------------------------------------------------
+    ' INITIALIZATION
+    '--------------------------------------------------------------
+    bAbort = False
+    additionalCustAddr = ""
+    custNameNegNewsNoMiddle = ""
+    wasAlreadyOpen = False
+    totalCPs = 0
+    spSyncStatus = "SKIPPED"
+    actualSearchCount = 0
+
+    If Not SheetExists(ThisWorkbook, "Sheet1") Then
+        MsgBox "Required sheet 'Sheet1' is missing. Please use the original template.", _
+               vbCritical, "Template Error"
+        Exit Sub
+    End If
+    Set ws = ThisWorkbook.Sheets("Sheet1")
+
+    Set WshShell = CreateObject("WScript.Shell")
+    Set FSO = CreateObject("Scripting.FileSystemObject")
+
+    '--------------------------------------------------------------
+    ' STEP 1: Resolve paths (dynamic OneDrive detection)
+    '--------------------------------------------------------------
+    userProfile = Environ("USERPROFILE")
+    If FSO.FolderExists(userProfile & "\OneDrive - Community Federal Savings Bank\Desktop") Then
+        desktopPath = userProfile & "\OneDrive - Community Federal Savings Bank\Desktop"
+    Else
+        desktopPath = userProfile & "\Desktop"
+    End If
+
+    ecmCase = SanitizeFileNamePart(Trim(CStr(ws.Range("J10").Value)))
+    alertID = SanitizeFileNamePart(Trim(CStr(ws.Range("J11").Value)))
+    custName = SanitizeFileNamePart(Trim(CStr(ws.Range("J14").Value)))
+    custAddr = SanitizeFileNamePart(Trim(CStr(ws.Range("J15").Value)))
+
+    If custName = "" And Application.CountA(ws.Range("J19:J24")) = 0 Then
+        MsgBox "I don't see a Customer Name or any Counterparties to search. " & _
+               "Please fill them in first!", vbExclamation, "Nothing to Search"
+        Exit Sub
+    End If
+
+    If ecmCase = "" Then
+        MsgBox "I don't see an ECM Case ID in cell J10. Please enter it before running.", _
+               vbExclamation, "Missing Case ID"
+        Exit Sub
+    End If
+
+    negWords = " AND (arrest OR corruption OR sentencing OR money laundering OR AML " & _
+               "OR launder OR embezzle OR evas OR evad OR crime OR corrupt OR bribe OR " & _
+               "theft OR extort OR drug OR traffic OR trafficking OR felony OR sanction " & _
+               "OR counterfeit OR terror)"
+
+    baseFileName = ecmCase & "_" & alertID
+    baseFileName = Replace(baseFileName, " ", "_")
+    Do While InStr(baseFileName, "__") > 0
+        baseFileName = Replace(baseFileName, "__", "_")
+    Loop
+    ' Strip leading/trailing underscores (Bucket 1 / D)
+    Do While Len(baseFileName) > 0 And Right(baseFileName, 1) = "_"
+        baseFileName = Left(baseFileName, Len(baseFileName) - 1)
+    Loop
+    Do While Len(baseFileName) > 0 And Left(baseFileName, 1) = "_"
+        baseFileName = Mid(baseFileName, 2)
+    Loop
+
+    caseFolderPath = desktopPath & "\" & ecmCase
+    If Not FSO.FolderExists(caseFolderPath) Then FSO.CreateFolder caseFolderPath
+
+    mainFolderPath = caseFolderPath & "\OSDD Searches"
+    If Not FSO.FolderExists(mainFolderPath) Then FSO.CreateFolder mainFolderPath
+
+    totalCPs = Application.CountA(ws.Range("J19:J24"))
+
+    '--------------------------------------------------------------
+    ' STEP 2: Kick off async DNS/TLS warmup (fire-and-forget)
+    '         Runs in the background while user clicks through prompts.
+    '--------------------------------------------------------------
+    LogStep "STEP 2: before AutoPrewarmDNS"
+    AutoPrewarmDNS
+    LogStep "STEP 2: after AutoPrewarmDNS"
+
+    '--------------------------------------------------------------
+    ' STEP 3: User prompts
+    '--------------------------------------------------------------
+    If custName <> "" Then
+        LogStep "STEP 3: before customer negnews InputBox"
+        Application.StatusBar = "OSINT: Waiting for Customer Negative News input..."
+        Beep
+        ForcePromptToFront
+        custNameNegNews = InputBox( _
+            "Do you want to run a Negative News search for the Customer? " & _
+            "You can edit the name below, or delete it completely to skip.", _
+            "Customer Negative News", custName)
+        LogStep "STEP 3: customer negnews returned, len=" & Len(custNameNegNews)
+        If StrPtr(custNameNegNews) = 0 Then Exit Sub
+
+        ' Normalize internal whitespace so "John  Smith" doesn't fake a middle name (Bucket 1 / E)
+        custNameNegNews = NormalizeSpaces(custNameNegNews)
+        LogStep "STEP 3: after NormalizeSpaces, len=" & Len(custNameNegNews)
+
+        If Trim(custNameNegNews) <> "" Then
+            nameParts = Split(Trim(custNameNegNews), " ")
+            LogStep "STEP 3: Split into " & (UBound(nameParts) + 1) & " parts"
+            If UBound(nameParts) >= 2 Then
+                custNameNegNewsNoMiddle = nameParts(0) & " " & nameParts(UBound(nameParts))
+                LogStep "STEP 3: before middle-name InputBox"
+                Application.StatusBar = "OSINT: Waiting for Middle Name confirmation..."
+                Beep
+                ForcePromptToFront
+                custNameNegNewsNoMiddle = InputBox( _
+                    "I noticed the customer might have a middle name (" & custNameNegNews & ")." & _
+                    vbCrLf & vbCrLf & "If you want to run an additional search WITHOUT the middle " & _
+                    "name, you can edit/confirm the name below." & vbCrLf & _
+                    "(Clear the text or click Cancel to skip this extra search)", _
+                    "Middle Name Detected", custNameNegNewsNoMiddle)
+                LogStep "STEP 3: middle-name InputBox returned"
+                If StrPtr(custNameNegNewsNoMiddle) = 0 Then custNameNegNewsNoMiddle = ""
+                custNameNegNewsNoMiddle = NormalizeSpaces(custNameNegNewsNoMiddle)
+            End If
+        End If
+
+        LogStep "STEP 3: before Sigma address MsgBox"
+        Application.StatusBar = "OSINT: Waiting for Sigma Address decision..."
+        Dim sigmaResp As Long
+        sigmaResp = TopMostMsgBox( _
+            "Did you identify any additional addresses for the Customer via Sigma?", _
+            "Sigma Address Check", MB_YESNO Or MB_ICONQUESTION Or MB_TOPMOST)
+        LogStep "STEP 3: Sigma TopMostMsgBox returned " & sigmaResp
+        If sigmaResp = IDYES Then
+            LogStep "STEP 3: before additional-address InputBox"
+            Beep
+            ForcePromptToFront
+            additionalCustAddr = InputBox( _
+                "Please paste the additional address identified via Sigma below:", _
+                "Enter Additional Address")
+            LogStep "STEP 3: additional-address returned"
+            If StrPtr(additionalCustAddr) = 0 Then Exit Sub
+            additionalCustAddr = NormalizeSpaces(additionalCustAddr)
+        End If
+    End If
+    LogStep "STEP 3: customer prompts complete"
+
+    For i = 19 To 24
+        cpName = SanitizeFileNamePart(Trim(CStr(ws.Range("J" & i).Value)))
+        If cpName <> "" Then
+            Application.StatusBar = "OSINT: Waiting for CP '" & cpName & "' Negative News input..."
+            Beep
+            ForcePromptToFront
+            cpNameNegNews(i) = InputBox( _
+                "Do you want to run a Negative News search for this Counterparty? " & _
+                "You can edit the name or clear it to skip.", _
+                "Counterparty: " & cpName, cpName)
+            If StrPtr(cpNameNegNews(i)) = 0 Then Exit Sub
+            cpNameNegNews(i) = NormalizeSpaces(cpNameNegNews(i))
+
+            If Trim(cpNameNegNews(i)) <> "" Then
+                nameParts = Split(Trim(cpNameNegNews(i)), " ")
+                If UBound(nameParts) >= 2 Then
+                    cpNameNegNewsNoMiddle(i) = nameParts(0) & " " & nameParts(UBound(nameParts))
+                    Application.StatusBar = "OSINT: Waiting for CP '" & cpName & "' Middle Name confirmation..."
+                    Beep
+                    ForcePromptToFront
+                    cpNameNegNewsNoMiddle(i) = InputBox( _
+                        "I noticed the counterparty might have a middle name (" & _
+                        cpNameNegNews(i) & ")." & vbCrLf & vbCrLf & _
+                        "If you want to run an additional search WITHOUT the middle name, " & _
+                        "you can edit/confirm the name below." & vbCrLf & _
+                        "(Clear the text or click Cancel to skip this extra search)", _
+                        "Middle Name Detected", cpNameNegNewsNoMiddle(i))
+                    If StrPtr(cpNameNegNewsNoMiddle(i)) = 0 Then cpNameNegNewsNoMiddle(i) = ""
+                    cpNameNegNewsNoMiddle(i) = NormalizeSpaces(cpNameNegNewsNoMiddle(i))
+                End If
+            End If
+        End If
+    Next i
+
+    LogStep "STEP 3: before Starting Searches MsgBox"
+    Application.StatusBar = "OSINT: Waiting for Starting-Searches confirmation..."
+    TopMostMsgBox _
+        "I'm going to run the searches now! Please keep your hands off the mouse " & _
+        "and keyboard so I don't get interrupted." & vbCrLf & vbCrLf & _
+        "(If things go wrong, just hold down the ESC key for 2 seconds to stop me).", _
+        "Starting Searches", MB_OK Or MB_ICONINFO
+    LogStep "STEP 3: Starting Searches MsgBox dismissed -> proceeding to searches"
+
+    '--------------------------------------------------------------
+    ' STEP 4: Safety guard + runtime optimizations
+    '--------------------------------------------------------------
+    If Not CheckDiskSpace() Then Exit Sub
+
+    AutoPrepareRuntime
+    StartTime = Now
+
+    '--------------------------------------------------------------
+    ' STEP 5: Customer searches - build batch, run in parallel
+    '--------------------------------------------------------------
+    If custName <> "" Then
+        custLabel = "Customer (" & custName & ")"
+        Application.StatusBar = "OSINT: " & custLabel & " -> Queueing searches..."
+
+        Set custBatch = New Collection
+        fileCounter = 1
+
+        custBatch.Add Array(custName, _
+                            mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Google.pdf", _
+                            1, "Google name")
+        fileCounter = fileCounter + 1
+
+        If custAddr <> "" Then
+            custBatch.Add Array(custAddr, _
+                                mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Address.pdf", _
+                                1, "Address")
+            fileCounter = fileCounter + 1
+
+            custBatch.Add Array(custName & " + " & custAddr, _
+                                mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Google+Address.pdf", _
+                                1, "Name + Address")
+            fileCounter = fileCounter + 1
+        End If
+
+        If Trim(additionalCustAddr) <> "" Then
+            custBatch.Add Array(custName & " + " & additionalCustAddr, _
+                                mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Name+Additional Address.pdf", _
+                                1, "Name + Additional Address")
+            fileCounter = fileCounter + 1
+        End If
+
+        If Trim(custNameNegNews) <> "" Then
+            custBatch.Add Array("""" & custNameNegNews & """" & negWords, _
+                                mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Negative News 1.pdf", _
+                                1, "Negative News page 1")
+            fileCounter = fileCounter + 1
+            custBatch.Add Array("""" & custNameNegNews & """" & negWords, _
+                                mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Negative News 2.pdf", _
+                                2, "Negative News page 2")
+            fileCounter = fileCounter + 1
+        End If
+
+        If Trim(custNameNegNewsNoMiddle) <> "" And _
+           StrComp(custNameNegNewsNoMiddle, custNameNegNews, vbTextCompare) <> 0 Then
+            custBatch.Add Array("""" & custNameNegNewsNoMiddle & """" & negWords, _
+                                mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Negative News 3.pdf", _
+                                1, "Negative News w/o middle, page 1")
+            fileCounter = fileCounter + 1
+            custBatch.Add Array("""" & custNameNegNewsNoMiddle & """" & negWords, _
+                                mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Negative News 4.pdf", _
+                                2, "Negative News w/o middle, page 2")
+            fileCounter = fileCounter + 1
+        End If
+
+        actualSearchCount = actualSearchCount + RunSearchBatch(custBatch, custLabel, WshShell)
+        If bAbort Then GoTo AbortProcess
+    End If
+
+    '--------------------------------------------------------------
+    ' STEP 6: Counterparty searches - one parallel batch per CP
+    '--------------------------------------------------------------
+    cpLoopPosition = 0
+    For i = 19 To 24
+        cpName = SanitizeFileNamePart(Trim(CStr(ws.Range("J" & i).Value)))
+        cpAddr = SanitizeFileNamePart(Trim(CStr(ws.Range("T" & i).Value)))
+
+        If cpName <> "" Then
+            cpLoopPosition = cpLoopPosition + 1
+            cpLabel = "CP " & cpLoopPosition & " of " & totalCPs & " (" & cpName & ")"
+            Application.StatusBar = "OSINT: " & cpLabel & " -> Queueing searches..."
+
+            Set cpBatch = New Collection
+            fileCounter = 1
+
+            cpBatch.Add Array(cpName, _
+                              mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Google.pdf", _
+                              1, "Google name")
+            fileCounter = fileCounter + 1
+
+            If cpAddr <> "" Then
+                cpBatch.Add Array(cpAddr, _
+                                  mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Address.pdf", _
+                                  1, "Address")
+                fileCounter = fileCounter + 1
+
+                cpBatch.Add Array(cpName & " + " & cpAddr, _
+                                  mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Google+Address.pdf", _
+                                  1, "Name + Address")
+                fileCounter = fileCounter + 1
+            End If
+
+            If Trim(cpNameNegNews(i)) <> "" Then
+                cpBatch.Add Array("""" & cpNameNegNews(i) & """" & negWords, _
+                                  mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Negative News 1.pdf", _
+                                  1, "Negative News page 1")
+                fileCounter = fileCounter + 1
+                cpBatch.Add Array("""" & cpNameNegNews(i) & """" & negWords, _
+                                  mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Negative News 2.pdf", _
+                                  2, "Negative News page 2")
+                fileCounter = fileCounter + 1
+            End If
+
+            If Trim(cpNameNegNewsNoMiddle(i)) <> "" And _
+               StrComp(cpNameNegNewsNoMiddle(i), cpNameNegNews(i), vbTextCompare) <> 0 Then
+                cpBatch.Add Array("""" & cpNameNegNewsNoMiddle(i) & """" & negWords, _
+                                  mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Negative News 3.pdf", _
+                                  1, "Negative News w/o middle, page 1")
+                fileCounter = fileCounter + 1
+                cpBatch.Add Array("""" & cpNameNegNewsNoMiddle(i) & """" & negWords, _
+                                  mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Negative News 4.pdf", _
+                                  2, "Negative News w/o middle, page 2")
+                fileCounter = fileCounter + 1
+            End If
+
+            actualSearchCount = actualSearchCount + RunSearchBatch(cpBatch, cpLabel, WshShell)
+            If bAbort Then GoTo AbortProcess
+        End If
+    Next i
+
+    '--------------------------------------------------------------
+    ' STEP 7: Elapsed time + entity count (midnight-safe)
+    '--------------------------------------------------------------
+    ElapsedSeconds = DateDiff("s", StartTime, Now)
+    Minutes = ElapsedSeconds \ 60
+    Seconds = ElapsedSeconds Mod 60
+    If Minutes > 0 Then
+        timeString = Minutes & " minute(s) and " & Seconds & " second(s)"
+    Else
+        timeString = Seconds & " second(s)"
+    End If
+
+    entityCount = IIf(custName <> "" Or custNameNegNews <> "", 1, 0) + totalCPs
+    ' actualSearchCount is the authoritative successful-PDF counter.
+    ' NO file-enum re-count (that was the v2.4.5 bug that returned 0
+    ' while OneDrive was still syncing).
+
+    '--------------------------------------------------------------
+    ' STEP 8: Local audit log
+    '--------------------------------------------------------------
+    Set auditWs = GetOrCreateAuditSheet(ThisWorkbook)
+    nextAuditRow = auditWs.Cells(auditWs.Rows.Count, "A").End(xlUp).Row + 1
+    auditWs.Cells(nextAuditRow, 1).Value = Now
+    auditWs.Cells(nextAuditRow, 2).Value = Environ("USERNAME")
+    auditWs.Cells(nextAuditRow, 3).Value = ecmCase
+    auditWs.Cells(nextAuditRow, 4).Value = entityCount
+    auditWs.Cells(nextAuditRow, 5).Value = actualSearchCount
+    auditWs.Cells(nextAuditRow, 6).Value = timeString
+    auditWs.Cells(nextAuditRow, 7).Value = TOOL_VERSION
+    ThisWorkbook.Save
+
+    '--------------------------------------------------------------
+    ' STEP 9: Restore runtime + open folder IMMEDIATELY
+    '         (user sees PDFs while SharePoint push happens next)
+    '--------------------------------------------------------------
+    AutoRestoreRuntime
+    Application.StatusBar = "OSINT: Opening folder and syncing to SharePoint..."
+
+    On Error Resume Next
+    shell "explorer.exe """ & mainFolderPath & """", vbNormalFocus
+    On Error GoTo ErrorHandler
+
+    '--------------------------------------------------------------
+    ' STEP 10: SharePoint master tracker push (with status bar updates)
+    '--------------------------------------------------------------
+    Application.StatusBar = "OSINT: Pushing run to SharePoint master tracker..."
+
+    For Each wb In Application.Workbooks
+        If wb.Name = MASTER_FILENAME Then
+            Set masterWb = wb
+            wasAlreadyOpen = True
+            Exit For
+        End If
+    Next wb
+
+    If masterWb Is Nothing Then
+        Set ghostApp = CreateObject("Excel.Application")
+        ghostApp.Visible = False
+        ghostApp.DisplayAlerts = False
+        ghostApp.EnableEvents = False
+
+        On Error Resume Next
+        Err.Clear
+        Set masterWb = ghostApp.Workbooks.Open(Filename:=MASTER_PATH, UpdateLinks:=False)
+        If masterWb Is Nothing Then
+            spSyncStatus = "FAILED: " & IIf(Err.Number <> 0, _
+                "Err " & Err.Number & " - " & Err.Description, _
+                "WebDAV open returned Nothing (offline, auth, or file renamed?)")
+        End If
+        On Error GoTo ErrorHandler
+    End If
+
+    If Not masterWb Is Nothing Then
+        If Not masterWb.ReadOnly Then
+            Set masterWs = masterWb.Sheets("Sheet1")
+            expectedHeaders = Array("Date & Time", "Analyst ID", "ECM Case ID", _
+                                    "Total Entities", "Total Searches", "Time Taken", "Tool Version")
+            headersOK = True
+            headerMsg = ""
+
+            For hdrIdx = LBound(expectedHeaders) To UBound(expectedHeaders)
+                If masterWs.Cells(1, hdrIdx + 1).Value <> expectedHeaders(hdrIdx) Then
+                    headersOK = False
+                    headerMsg = headerMsg & "- Col " & _
+                        Split(masterWs.Cells(1, hdrIdx + 1).Address, "$")(1) & _
+                        " expected '" & expectedHeaders(hdrIdx) & "' but found '" & _
+                        masterWs.Cells(1, hdrIdx + 1).Value & "'" & vbCrLf
+                End If
+            Next hdrIdx
+
+            If headersOK Then
+                mRow = masterWs.Cells(masterWs.Rows.Count, "A").End(xlUp).Row + 1
+                masterWs.Cells(mRow, 1).Value = Now
+                masterWs.Cells(mRow, 2).Value = Environ("USERNAME")
+                masterWs.Cells(mRow, 3).Value = ecmCase
+                masterWs.Cells(mRow, 4).Value = entityCount
+                masterWs.Cells(mRow, 5).Value = actualSearchCount
+                masterWs.Cells(mRow, 6).Value = timeString
+                masterWs.Cells(mRow, 7).Value = TOOL_VERSION
+
+                If wasAlreadyOpen Then
+                    masterWb.Save
+                Else
+                    masterWb.Close SaveChanges:=True
+                End If
+                spSyncStatus = "OK"
+            Else
+                spSyncStatus = "FAILED: header mismatch -" & vbCrLf & headerMsg
+                If Not wasAlreadyOpen Then masterWb.Close SaveChanges:=False
+            End If
+        Else
+            spSyncStatus = "FAILED: master tracker is read-only (another user has it open?)"
+            If Not wasAlreadyOpen Then masterWb.Close SaveChanges:=False
+        End If
+    End If
+
+    If Not ghostApp Is Nothing Then
+        On Error Resume Next
+        ghostApp.Quit
+        Set ghostApp = Nothing
+        On Error GoTo ErrorHandler
+    End If
+
+    Application.StatusBar = False
+
+    '--------------------------------------------------------------
+    ' STEP 11: Final summary dialog (includes SP status)
+    '--------------------------------------------------------------
+    AppActivate Application.Caption
+
+    Dim summary As String
+    summary = "All done! I saved " & actualSearchCount & " PDF(s) directly into:" & vbCrLf & _
+              "  " & ecmCase & "\OSDD Searches" & vbCrLf & vbCrLf & _
+              "Total search time: " & timeString & vbCrLf & vbCrLf
+
+    Select Case True
+        Case spSyncStatus = "OK"
+            summary = summary & "SharePoint master tracker: updated." & vbCrLf & _
+                      "Your local Audit_Log also has this run."
+        Case spSyncStatus = "SKIPPED"
+            summary = summary & "SharePoint master tracker: not attempted." & vbCrLf & _
+                      "Your local Audit_Log has this run."
+        Case Else
+            summary = summary & "WARNING: SharePoint master tracker was NOT updated." & vbCrLf & _
+                      spSyncStatus & vbCrLf & vbCrLf & _
+                      "Your local Audit_Log still has this run. Please notify the team lead."
+    End Select
+
+    If spSyncStatus = "OK" Or spSyncStatus = "SKIPPED" Then
+        MsgBox summary, vbInformation, "Success"
+    Else
+        MsgBox summary, vbExclamation, "Success - SharePoint sync failed"
+    End If
+
+    Set WshShell = Nothing
+    Set FSO = Nothing
+    GoTo CleanExit
+
+'------------------------------------------------------------------
+' ABORT PATH (user pressed ESC)
+'------------------------------------------------------------------
+AbortProcess:
+    AutoRestoreRuntime
+    On Error Resume Next
+    AppActivate Application.Caption
+    On Error GoTo 0
+    MsgBox "You safely canceled the process. Any PDFs already downloaded " & _
+           "are in the case folder." & vbCrLf & vbCrLf & _
+           "Note: any Edge processes still running will finish on their own " & _
+           "and their output will also land in the folder.", _
+           vbInformation, "Canceled"
+    GoTo CleanExit
+
+'------------------------------------------------------------------
+' GLOBAL ERROR HANDLER (Bucket 1 / A) - replaces silent GoTo CleanExit
+'------------------------------------------------------------------
+ErrorHandler:
+    Dim errN As Long, errD As String, errS As String
+    errN = Err.Number
+    errD = Err.Description
+    errS = Err.Source
+
+    On Error Resume Next
+    LogStep "ERROR Err " & errN & ": " & errD & " [src: " & errS & "]"
+
+    ' Log to audit sheet (col H for error diag). We intentionally do
+    ' NOT call ThisWorkbook.Save here - if the workbook is on OneDrive
+    ' and sync is blocked, Save can hang indefinitely and freeze Excel.
+    ' Analyst can save manually when they dismiss the MsgBox.
+    If auditWs Is Nothing Then Set auditWs = GetOrCreateAuditSheet(ThisWorkbook)
+    Dim errRow As Long
+    errRow = auditWs.Cells(auditWs.Rows.Count, "A").End(xlUp).Row + 1
+    auditWs.Cells(errRow, 1).Value = Now
+    auditWs.Cells(errRow, 2).Value = Environ("USERNAME")
+    auditWs.Cells(errRow, 3).Value = ecmCase
+    auditWs.Cells(errRow, 4).Value = entityCount
+    auditWs.Cells(errRow, 5).Value = actualSearchCount
+    auditWs.Cells(errRow, 6).Value = "ERROR"
+    auditWs.Cells(errRow, 7).Value = TOOL_VERSION
+    auditWs.Cells(errRow, 8).Value = "Err " & errN & ": " & errD & " [src: " & errS & "]"
+
+    AutoRestoreRuntime
+    Application.StatusBar = False
+
+    MsgBox "Something went wrong and I had to stop." & vbCrLf & vbCrLf & _
+           "Error " & errN & ": " & errD & vbCrLf & _
+           "Source: " & errS & vbCrLf & vbCrLf & _
+           "Details are in the Audit_Log sheet (column H) and in " & _
+           Environ("TEMP") & "\osint_debug.log. " & _
+           "Please Ctrl+S to save the workbook if you want to keep the audit row. " & _
+           "Any PDFs already saved are safe in the case folder. " & _
+           "You can re-run the macro; already-downloaded searches will be " & _
+           "overwritten with fresh copies.", _
+           vbCritical + vbSystemModal, "OSINT Error"
+    On Error GoTo 0
+    ' fall through to CleanExit
+
+CleanExit:
+    On Error Resume Next
+    If Not ghostApp Is Nothing Then
+        ghostApp.Quit
+        Set ghostApp = Nothing
+    End If
+    AutoRestoreRuntime
+    Application.StatusBar = False
+    On Error GoTo 0
+
+End Sub
+
+'==================================================================
+' SAFETY GUARDS
+'==================================================================
+
+Private Function CheckDiskSpace() As Boolean
+    On Error Resume Next
+    Dim FSO As Object, drv As Object
+    Set FSO = CreateObject("Scripting.FileSystemObject")
+    Set drv = FSO.GetDrive(FSO.GetDriveName(Environ("USERPROFILE")))
+
+    Dim freeGB As Double
+    freeGB = drv.FreeSpace / (1024 ^ 3)
+    On Error GoTo 0
+
+    If freeGB < DISK_ABORT_GB Then
+        MsgBox "CRITICAL: Only " & Format(freeGB, "0.0") & " GB free on your VDI." & vbCrLf & _
+               "The tool needs at least " & DISK_ABORT_GB & " GB to run safely. Aborting." & vbCrLf & vbCrLf & _
+               "Please empty Recycle Bin, clear Downloads, or contact IT to free up space.", _
+               vbCritical, "Disk Full"
+        CheckDiskSpace = False
+    ElseIf freeGB < DISK_WARN_GB Then
+        Dim r As VbMsgBoxResult
+        r = MsgBox("WARNING: Only " & Format(freeGB, "0.0") & " GB free on your VDI." & vbCrLf & _
+                   "A typical 20-search run uses ~700 MB. Continue anyway?", _
+                   vbYesNo + vbExclamation, "Low Disk Space")
+        CheckDiskSpace = (r = vbYes)
+    Else
+        CheckDiskSpace = True
+    End If
+End Function
+
+'==================================================================
+' STATUS BAR - granular per-search updates (single-task path)
+'==================================================================
+Private Sub SetSearchStatus(entityLabel As String, searchType As String)
+    Application.StatusBar = "OSINT: " & entityLabel & " -> " & searchType & "..."
+End Sub
+
+'==================================================================
+' RUNTIME OPTIMIZER (AppLocker-safe)
+'==================================================================
+
+Public Sub AutoPrepareRuntime()
+    On Error Resume Next
+    If m_runtimeApplied Then Exit Sub
+
+    With Application
+        m_origCalc = .Calculation
+        m_origScreenUpdate = .ScreenUpdating
+        m_origEvents = .EnableEvents
+        m_origAlerts = .DisplayAlerts
+        m_origCursor = .Cursor
+        m_origPrintComm = .PrintCommunication
+
+        .Calculation = xlCalculationManual
+        .ScreenUpdating = False
+        .EnableEvents = False
+        .DisplayAlerts = False
+        .Cursor = xlWait
+        .PrintCommunication = False
+    End With
+
+    m_runtimeApplied = True
+    On Error GoTo 0
+End Sub
+
+Public Sub AutoRestoreRuntime()
+    On Error Resume Next
+    If Not m_runtimeApplied Then
+        Application.StatusBar = False
+        Exit Sub
+    End If
+
+    With Application
+        .Calculation = m_origCalc
+        .ScreenUpdating = m_origScreenUpdate
+        .EnableEvents = m_origEvents
+        .DisplayAlerts = m_origAlerts
+        .Cursor = m_origCursor
+        .PrintCommunication = m_origPrintComm
+        .StatusBar = False
+    End With
+
+    m_runtimeApplied = False
+    On Error GoTo 0
+End Sub
+
+'------------------------------------------------------------------
+' Async DNS/TLS warmup - fired before user prompts (Bucket 2 / F).
+' We don't wait for the response. Connection + TLS session is
+' cached in the Windows socket pool, so the first real Edge search
+' skips most of the handshake.
+'------------------------------------------------------------------
+Public Sub AutoPrewarmDNS()
+    On Error Resume Next
+    Dim http As Object
+    Set http = CreateObject("MSXML2.ServerXMLHTTP.6.0")
+    http.SetTimeouts 1500, 2000, 3000, 3000
+    http.Open "HEAD", "https://www.google.com/", True   ' True = async
+    http.Send
+    ' Intentionally NOT calling WaitForResponse - fire and forget.
+    Set http = Nothing
+    On Error GoTo 0
+End Sub
+
+'------------------------------------------------------------------
+' Raise Excel to the foreground so the next InputBox/MsgBox shows
+' on top of everything. Cheap insurance against "invisible dialog"
+' hangs on locked-down VDIs.
+'------------------------------------------------------------------
+Private Sub ForcePromptToFront()
+    On Error Resume Next
+    AppActivate Application.Caption
+    DoEvents
+    On Error GoTo 0
+End Sub
+
+'------------------------------------------------------------------
+' Direct Win32 MessageBoxW call with MB_TOPMOST + MB_SETFOREGROUND.
+' VBA's MsgBox (even with vbSystemModal) is unreliable on Citrix/VDI
+' because the VDI compositor owns the z-order. Calling MessageBoxW
+' directly sidesteps the VBA wrapper entirely.
+' Returns IDOK / IDYES / IDNO (Win32 codes).
+'------------------------------------------------------------------
+Private Function TopMostMsgBox(ByVal msg As String, _
+                               ByVal title As String, _
+                               ByVal flags As Long) As Long
+    Beep   ' audible cue for the analyst
+    On Error Resume Next
+    AppActivate Application.Caption
+    DoEvents
+    On Error GoTo 0
+    TopMostMsgBox = MessageBoxW(0, StrPtr(msg), StrPtr(title), _
+                                flags Or MB_TOPMOST Or MB_SETFOREGROUND Or MB_SYSTEMMODAL)
+End Function
+
+'------------------------------------------------------------------
+' File-based step log. Writes one timestamped line per call to
+' %TEMP%\osint_debug.log. Survives VBA crashes, hangs, Excel kills.
+' Open the file from "Run -> %TEMP%" to diagnose.
+'------------------------------------------------------------------
+Public Sub LogStep(ByVal msg As String)
+    On Error Resume Next
+    Dim fnum As Integer, logPath As String, attempt As Long
+    logPath = Environ("TEMP") & "\osint_debug.log"
+    ' Retry up to 3x with Shared lock so Notepad/Notepad++ holding the
+    ' file open cannot silently swallow log lines.
+    For attempt = 1 To 3
+        fnum = FreeFile
+        Err.Clear
+        Open logPath For Append Shared As #fnum
+        If Err.Number = 0 Then
+            Print #fnum, Format(Now, "yyyy-mm-dd hh:nn:ss") & " | " & msg
+            Close #fnum
+            Exit For
+        End If
+    Next attempt
+    On Error GoTo 0
+End Sub
+
+Public Function BuildEdgeArgs(ByVal url As String) As String
+    ' Used by INTERACTIVE fallback mode (USE_HEADLESS = False).
+    ' V2 Cloud / Xen / AMD EPYC / no-GPU optimized.
+    BuildEdgeArgs = _
+        "--disable-gpu --disable-gpu-compositing --disable-software-rasterizer " & _
+        "--disable-background-timer-throttling --disable-renderer-backgrounding " & _
+        "--disable-backgrounding-occluded-windows " & _
+        "--disable-features=CalculateNativeWinOcclusion,VizDisplayCompositor " & _
+        "--renderer-process-limit=2 " & _
+        "--no-first-run --no-default-browser-check --disable-sync --disable-extensions " & _
+        "--lang=en-US """ & url & """"
+End Function
+
+'==================================================================
+' PARALLEL SEARCH DISPATCH (Bucket 3)
+'==================================================================
+
+' Runs a collection of search tasks.
+' Each task is Array(query, savePath, pageNum, description).
+' In headless mode: up to MAX_PARALLEL concurrent msedge.exe.
+' In interactive mode: serial (one at a time).
+' Returns the count of tasks that produced a valid PDF.
+Private Function RunSearchBatch(tasks As Collection, _
+                                entityLabel As String, _
+                                wsh As Object) As Long
+    If tasks Is Nothing Then Exit Function
+    If tasks.Count = 0 Then Exit Function
+
+    If USE_HEADLESS Then
+        RunSearchBatch = RunSearchBatchParallel(tasks, entityLabel, wsh)
+    Else
+        RunSearchBatch = RunSearchBatchSerial(tasks, entityLabel, wsh)
+    End If
+End Function
+
+Private Function RunSearchBatchParallel(tasks As Collection, _
+                                        entityLabel As String, _
+                                        wsh As Object) As Long
+    On Error GoTo Fail
+
+    Dim n As Long: n = tasks.Count
+    If n = 0 Then Exit Function
+
+    Dim qry() As String, pth() As String, pg() As Long, dsc() As String
+    Dim st() As Long         ' 0=pending, 1=running, 2=done, 3=failed
+    Dim launchT() As Date    ' launch moment
+    Dim wk() As Long         ' worker slot used
+    ReDim qry(1 To n), pth(1 To n), pg(1 To n), dsc(1 To n)
+    ReDim st(1 To n), launchT(1 To n), wk(1 To n)
+
+    Dim i As Long, a As Variant
+    For i = 1 To n
+        a = tasks(i)
+        qry(i) = CStr(a(0))
+        pth(i) = CStr(a(1))
+        pg(i) = CLng(a(2))
+        dsc(i) = CStr(a(3))
+    Next i
+
+    Dim busy() As Boolean
+    ReDim busy(0 To MAX_PARALLEL - 1)
+
+    Dim doneCount As Long, runningCount As Long, successCount As Long
+    Dim w As Long, pendingFound As Boolean
+    Dim cmd As String
+    Dim sz As Long
+
+    Do
+        ' Fill any free worker slots with pending tasks
+        For w = 0 To MAX_PARALLEL - 1
+            If bAbort Then Exit For   ' stop dispatching as soon as ESC is seen
+            If Not busy(w) Then
+                pendingFound = False
+                For i = 1 To n
+                    If bAbort Then Exit For
+                    If st(i) = 0 Then
+                        ' Clear any stale file (rerun / OneDrive leftover)
+                        On Error Resume Next
+                        If Dir(pth(i)) <> "" Then Kill pth(i)
+                        On Error GoTo Fail
+
+                        cmd = BuildHeadlessEdgeCmd(qry(i), pth(i), pg(i), w)
+
+                        ' Non-blocking launch: Run(cmd, windowStyle, waitOnReturn=False)
+                        wsh.Run cmd, 0, False
+
+                        st(i) = 1
+                        launchT(i) = Now
+                        wk(i) = w
+                        busy(w) = True
+                        runningCount = runningCount + 1
+                        pendingFound = True
+
+                        SmartWait T(LAUNCH_STAGGER_SEC), True
+                        Exit For
+                    End If
+                Next i
+                If Not pendingFound Then Exit For  ' queue empty
+            End If
+        Next w
+
+        ' Poll for completions or timeouts
+        For i = 1 To n
+            If st(i) = 1 Then
+                sz = 0
+                If Dir(pth(i)) <> "" Then
+                    On Error Resume Next
+                    sz = FileLen(pth(i))
+                    On Error GoTo Fail
+                End If
+
+                If sz > MIN_PDF_SIZE_BYTES Then
+                    st(i) = 2
+                    successCount = successCount + 1
+                    doneCount = doneCount + 1
+                    runningCount = runningCount - 1
+                    busy(wk(i)) = False
+
+                    If sz < CAPTCHA_SIZE_HINT Then
+                        Debug.Print "WARN: small PDF " & sz & "B (possible CAPTCHA) - " & _
+                                    dsc(i) & " -> " & pth(i)
+                    End If
+
+                ElseIf DateDiff("s", launchT(i), Now) > TASK_TIMEOUT_SEC Then
+                    st(i) = 3
+                    doneCount = doneCount + 1
+                    runningCount = runningCount - 1
+                    busy(wk(i)) = False
+                    Debug.Print "TIMEOUT: " & dsc(i) & " after " & TASK_TIMEOUT_SEC & "s"
+                End If
+            End If
+        Next i
+
+        ' Status bar: aggregate progress for this entity
+        Application.StatusBar = "OSINT: " & entityLabel & " - " & _
+            doneCount & "/" & n & " saved, " & runningCount & " running"
+
+        If bAbort Then Exit Do
+        SmartWait T(POLL_INTERVAL_SEC)
+    Loop While doneCount < n
+
+    RunSearchBatchParallel = successCount
+    Exit Function
+Fail:
+    ' On any unexpected error, return whatever succeeded so far.
+    ' The outer ErrorHandler will take over.
+    RunSearchBatchParallel = successCount
+End Function
+
+Private Function RunSearchBatchSerial(tasks As Collection, _
+                                      entityLabel As String, _
+                                      wsh As Object) As Long
+    Dim n As Long: n = tasks.Count
+    Dim i As Long, successCount As Long
+    Dim a As Variant
+
+    For i = 1 To n
+        a = tasks(i)
+        SetSearchStatus entityLabel, CStr(a(3)) & " (" & i & "/" & n & ")"
+        If PrintSearchToPDF(CStr(a(0)), CStr(a(1)), wsh, CLng(a(2))) Then
+            successCount = successCount + 1
+        End If
+        If bAbort Then Exit For
+    Next i
+
+    RunSearchBatchSerial = successCount
+End Function
+
+'==================================================================
+' SEARCH ENGINE
+'==================================================================
+
+Function PrintSearchToPDF(Query As String, savePath As String, wsh As Object, _
+                          Optional PageNum As Long = 1) As Boolean
+    If USE_HEADLESS Then
+        PrintSearchToPDF = PrintSearchToPDF_Headless(Query, savePath, PageNum, wsh, 0)
+    Else
+        PrintSearchToPDF = PrintSearchToPDF_Interactive(Query, savePath, wsh, PageNum)
+    End If
+End Function
+
+'------------------------------------------------------------------
+' HEADLESS MODE - single-task (kept for compatibility + interactive fallback).
+' Parallel dispatch calls BuildHeadlessEdgeCmd directly with per-worker idx.
+'------------------------------------------------------------------
+Private Function PrintSearchToPDF_Headless(Query As String, _
+                                           savePath As String, _
+                                           ByVal PageNum As Long, _
+                                           wsh As Object, _
+                                           ByVal workerIdx As Long) As Boolean
+    On Error GoTo FuncFail
+
+    Dim cmd As String
+
+    On Error Resume Next
+    If Dir(savePath) <> "" Then Kill savePath
+    On Error GoTo FuncFail
+
+    cmd = BuildHeadlessEdgeCmd(Query, savePath, PageNum, workerIdx)
+
+    ' Synchronous when called from the single-task path.
+    ' Parallel dispatch calls BuildHeadlessEdgeCmd directly and uses Run False.
+    wsh.Run cmd, 0, True
+
+    Dim resultSize As Long
+    If Dir(savePath) <> "" Then resultSize = FileLen(savePath)
+
+    If resultSize < CAPTCHA_SIZE_HINT And resultSize > MIN_PDF_SIZE_BYTES Then
+        Debug.Print "WARN: small headless PDF (" & resultSize & " B) - possible CAPTCHA: " & savePath
+    End If
+
+    PrintSearchToPDF_Headless = (resultSize > MIN_PDF_SIZE_BYTES)
+    Exit Function
+FuncFail:
+    PrintSearchToPDF_Headless = False
+End Function
+
+'------------------------------------------------------------------
+' Build headless Edge command line.
+' workerIdx selects --user-data-dir, so 3 parallel processes get
+' 3 independent profile locks instead of fighting for one.
+'------------------------------------------------------------------
+Private Function BuildHeadlessEdgeCmd(ByVal Query As String, _
+                                      ByVal savePath As String, _
+                                      ByVal PageNum As Long, _
+                                      ByVal workerIdx As Long) As String
+    Dim baseURL As String, edgeExe As String, profilePath As String
+    Dim ua As String, s As String
+
+    baseURL = "https://www.google.com/search?q=" & URLEncode(Query) & "&num=100&hl=en"
+    If PageNum > 1 Then baseURL = baseURL & "&start=" & ((PageNum - 1) * 10)
+
+    edgeExe = GetEdgePath
+    profilePath = GetWorkerProfilePath(workerIdx)
+
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " & _
+         "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
+
+    ' Build command in chunks to stay under VBA's 25-continuation limit.
+    ' --virtual-time-budget lets headless think 8s of JS timers have
+    ' elapsed immediately, so Google's lazy-loaded SERP content
+    ' resolves roughly 1s faster per search.
+    ' --no-pdf-header-footer is OMITTED on purpose so PDFs include
+    ' default Edge headers/footers (title, date, URL, page #).
+    s = """" & edgeExe & """"
+    s = s & " --headless=new"
+    s = s & " --disable-gpu"
+    s = s & " --disable-blink-features=AutomationControlled"
+    s = s & " --user-agent=""" & ua & """"
+    s = s & " --window-size=1280,900"
+    s = s & " --accept-lang=""en-US,en;q=0.9"""
+    s = s & " --user-data-dir=""" & profilePath & """"
+    s = s & " --no-first-run"
+    s = s & " --no-default-browser-check"
+    s = s & " --disable-logging --log-level=3"
+    s = s & " --disable-background-networking"
+    s = s & " --disable-breakpad"
+    s = s & " --disable-component-update"
+    s = s & " --disable-default-apps"
+    s = s & " --disable-hang-monitor"
+    s = s & " --disable-ipc-flooding-protection"
+    s = s & " --disable-translate"
+    s = s & " --disable-sync"
+    s = s & " --disable-client-side-phishing-detection"
+    s = s & " --disable-features=Translate,BlinkGenPropertyTrees,CalculateNativeWinOcclusion,VizDisplayCompositor"
+    s = s & " --metrics-recording-only"
+    s = s & " --mute-audio"
+    s = s & " --hide-scrollbars"
+    s = s & " --no-pings"
+    ' NOTE: --virtual-time-budget removed - it conflicted with
+    ' --headless=new + --print-to-pdf on some Edge builds, causing
+    ' Edge to render but never exit. --password-store / --use-mock-keychain
+    ' are Linux-oriented and ignored (or worse) on Windows Edge.
+    s = s & " --print-to-pdf=""" & savePath & """"
+    s = s & " """ & baseURL & """"
+
+    BuildHeadlessEdgeCmd = s
+End Function
+
+Private Function GetWorkerProfilePath(ByVal workerIdx As Long) As String
+    GetWorkerProfilePath = Environ("LOCALAPPDATA") & "\OSINT_EdgeWorker_" & workerIdx
+End Function
+
+Private Function GetEdgePath() As String
+    Dim candidates As Variant, p As Variant
+    candidates = Array( _
+        "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", _
+        "C:\Program Files\Microsoft\Edge\Application\msedge.exe", _
+        Environ("LOCALAPPDATA") & "\Microsoft\Edge\Application\msedge.exe")
+
+    For Each p In candidates
+        If Dir(CStr(p)) <> "" Then
+            GetEdgePath = CStr(p)
+            Exit Function
+        End If
+    Next p
+    GetEdgePath = "msedge.exe"
+End Function
+
+'------------------------------------------------------------------
+' INTERACTIVE MODE - fallback if USE_HEADLESS = False.
+' User's Edge print dialog controls headers/footers.
+'------------------------------------------------------------------
+Private Function PrintSearchToPDF_Interactive(Query As String, savePath As String, _
+                                              wsh As Object, ByVal PageNum As Long) As Boolean
+    On Error GoTo FuncFail
+
+    Dim baseURL As String, edgeArgs As String
+    Dim waitCounter As Long, retryPrint As Long, saveAttempts As Long
+    Dim isFileReady As Boolean, saveWindowReady As Boolean
+    Dim fileSizeCheck As Long
+    Dim retryResponse As VbMsgBoxResult
+    #If VBA7 Then
+        Dim hwndDialog As LongPtr, hEdge As LongPtr
+    #Else
+        Dim hwndDialog As Long, hEdge As Long
+    #End If
+
+    PrintSearchToPDF_Interactive = False
+    isFileReady = False
+
+    baseURL = "https://www.google.com/search?q=" & URLEncode(Query) & "&num=100&hl=en"
+    If PageNum > 1 Then baseURL = baseURL & "&start=" & ((PageNum - 1) * 10)
+StartSearch:
+    On Error Resume Next
+    If Dir(savePath) <> "" Then Kill savePath
+    On Error GoTo FuncFail
+
+    edgeArgs = BuildEdgeArgs(baseURL)
+    ShellExecute 0, "open", "msedge.exe", edgeArgs, "", 3
+
+    For waitCounter = 1 To 30
+        SmartWait T(0.5)
+        hEdge = FindWindow("Chrome_WidgetWin_1", vbNullString)
+        If hEdge <> 0 Then Exit For
+        If bAbort Then GoTo EmergencyClose
+    Next waitCounter
+    SmartWait T(1.5)
+
+    retryPrint = 0
+AttemptPrint:
+    If bAbort Then GoTo EmergencyClose
+
+    wsh.SendKeys "^p"
+    SmartWait T(3)
+    wsh.SendKeys "{ENTER}"
+
+    saveWindowReady = False
+    For waitCounter = 1 To 30
+        hwndDialog = FindWindow(vbNullString, "Save As")
+        If hwndDialog = 0 Then hwndDialog = FindWindow(vbNullString, "Save Print Output As")
+        If hwndDialog <> 0 Then saveWindowReady = True: Exit For
+        SmartWait T(0.4)
+        If bAbort Then GoTo EmergencyClose
+    Next waitCounter
+
+    If Not saveWindowReady Then
+        retryPrint = retryPrint + 1
+        If retryPrint <= 2 Then
+            SmartWait T(2)
+            GoTo AttemptPrint
+        Else
+            GoTo TriggerRetryPrompt
+        End If
+    End If
+
+    SmartWait T(0.8)
+    CopyToClipboard savePath
+    SmartWait T(0.4)
+
+    saveAttempts = 0
+    Do While saveAttempts < 5
+        hwndDialog = FindWindow(vbNullString, "Save As")
+        If hwndDialog = 0 Then hwndDialog = FindWindow(vbNullString, "Save Print Output As")
+        If hwndDialog <> 0 Then ForceForeground hwndDialog
+
+        SmartWait T(1.2)
+
+        wsh.SendKeys "^a"
+        SmartWait T(0.3)
+        wsh.SendKeys "{DEL}"
+        SmartWait T(0.3)
+        wsh.SendKeys "+{INSERT}"
+        SmartWait T(1.2)
+        wsh.SendKeys "%s"
+        SmartWait T(0.9)
+
+        hwndDialog = FindWindow(vbNullString, "Save As")
+        If hwndDialog = 0 Then hwndDialog = FindWindow(vbNullString, "Save Print Output As")
+        If hwndDialog = 0 Then Exit Do
+
+        If hwndDialog <> 0 Then ForceForeground hwndDialog
+        wsh.SendKeys "{ENTER}"
+        SmartWait T(0.9)
+
+        hwndDialog = FindWindow(vbNullString, "Save As")
+        If hwndDialog = 0 Then hwndDialog = FindWindow(vbNullString, "Save Print Output As")
+        If hwndDialog = 0 Then Exit Do
+
+        saveAttempts = saveAttempts + 1
+    Loop
+
+    For waitCounter = 1 To 40
+        SmartWait T(0.5)
+        If bAbort Then GoTo EmergencyClose
+
+        If Dir(savePath) <> "" Then
+            fileSizeCheck = 0
+            On Error Resume Next
+            fileSizeCheck = FileLen(savePath)
+            On Error GoTo FuncFail
+
+            If fileSizeCheck > MIN_PDF_SIZE_BYTES Then
+                isFileReady = True
+                Exit For
+            End If
+        End If
+    Next waitCounter
+
+    If isFileReady Then
+        PrintSearchToPDF_Interactive = True
+        SmartWait T(0.5)
+        SafeCloseBrowserTab wsh
+        Exit Function
+    End If
+TriggerRetryPrompt:
+    SafeCloseBrowserTab wsh
+    retryResponse = MsgBox("Failed to detect the saved PDF." & vbCrLf & vbCrLf & _
+                           "VBA was looking for the file exactly here:" & vbCrLf & savePath & _
+                           vbCrLf & vbCrLf & "Click Retry to restart this specific search.", _
+                           vbRetryCancel + vbCritical + vbSystemModal, "Save/Naming Error")
+
+    If retryResponse = vbRetry Then
+        SmartWait T(0.5)
+        GoTo StartSearch
+    Else
+        PrintSearchToPDF_Interactive = False
+        Exit Function
+    End If
+EmergencyClose:
+    SafeCloseBrowserTab wsh
+    SmartWait T(0.5)
+    Exit Function
+
+FuncFail:
+    On Error Resume Next
+    SafeCloseBrowserTab wsh
+    PrintSearchToPDF_Interactive = False
+End Function
+
+'==================================================================
+' WINDOW / SENDKEYS HELPERS
+'==================================================================
+
+#If VBA7 Then
+Private Sub ForceForeground(ByVal hTarget As LongPtr)
+#Else
+Private Sub ForceForeground(ByVal hTarget As Long)
+#End If
+    On Error Resume Next
+    Dim tidMe As Long, tidTarget As Long, dummyPid As Long
+    tidMe = GetCurrentThreadId()
+    tidTarget = GetWindowThreadProcessId(hTarget, dummyPid)
+    AttachThreadInput tidTarget, tidMe, 1
+    BringWindowToTop hTarget
+    SetForegroundWindow hTarget
+    AttachThreadInput tidTarget, tidMe, 0
+    On Error GoTo 0
+End Sub
+
+Sub SafeCloseBrowserTab(wsh As Object)
+    Application.EnableCancelKey = xlDisabled
+    SmartWait T(1.2), True
+
+    #If VBA7 Then
+        Dim hwndBrowser As LongPtr
+    #Else
+        Dim hwndBrowser As Long
+    #End If
+
+    hwndBrowser = FindWindow("Chrome_WidgetWin_1", vbNullString)
+    If hwndBrowser <> 0 Then ForceForeground hwndBrowser
+    SmartWait T(0.4), True
+
+    wsh.SendKeys "{ESC}"
+    SmartWait T(0.3), True
+    wsh.SendKeys "^w"
+    SmartWait T(0.5), True
+
+    On Error Resume Next
+    AppActivate Application.Caption
+    On Error GoTo 0
+
+    Application.EnableCancelKey = xlInterrupt
+End Sub
+
+'==================================================================
+' CLIPBOARD (validation + fallback)
+'==================================================================
+
+Sub CopyToClipboard(ByVal Text As String)
+    Dim objData As Object, verifyText As String
+    Dim clipboardSet As Boolean: clipboardSet = False
+
+    On Error Resume Next
+    Set objData = CreateObject("New:{1C3B4210-F441-11CE-B9EA-00AA006B1A69}")
+    If Not objData Is Nothing Then
+        objData.SetText Text
+        objData.PutInClipboard
+        objData.GetFromClipboard
+        verifyText = objData.GetText
+        If verifyText = Text Then clipboardSet = True
+    End If
+    On Error GoTo 0
+
+    If Not clipboardSet Then
+        On Error Resume Next
+        Dim ieClip As Object
+        Set ieClip = CreateObject("htmlfile")
+        ieClip.ParentWindow.ClipboardData.SetData "text", Text
+        Set ieClip = Nothing
+        On Error GoTo 0
+    End If
+
+    SmartWait T(0.3)
+    Set objData = Nothing
+End Sub
+
+'==================================================================
+' DATA HELPERS
+'==================================================================
+
+Function URLEncode(ByVal Text As String) As String
+    Dim i As Long, Char As String, EncodedText As String
+    EncodedText = ""
+    For i = 1 To Len(Text)
+        Char = Mid(Text, i, 1)
+        Select Case Asc(Char)
+            Case 48 To 57, 65 To 90, 97 To 122
+                EncodedText = EncodedText & Char
+            Case 32
+                EncodedText = EncodedText & "+"
+            Case Else
+                ' Zero-padded hex per RFC 3986 (Bucket 2 / J)
+                EncodedText = EncodedText & "%" & Right("0" & Hex(Asc(Char)), 2)
+        End Select
+    Next i
+    URLEncode = EncodedText
+End Function
+
+Function SanitizeFileNamePart(ByVal Text As String) As String
+    Dim invalidChars As Variant, i As Long
+
+    Text = Replace(Text, Chr(10), " ")
+    Text = Replace(Text, Chr(13), " ")
+    Text = Replace(Text, Chr(9), " ")
+
+    invalidChars = Array("""", "/", "\", ":", "*", "?", "<", ">", "|")
+    For i = LBound(invalidChars) To UBound(invalidChars)
+        Text = Replace(Text, invalidChars(i), " ")
+    Next i
+
+    Do While InStr(Text, "  ") > 0
+        Text = Replace(Text, "  ", " ")
+    Loop
+
+    Text = Trim(Text)
+    If IsReservedFilename(Text) Then Text = "_" & Text
+
+    SanitizeFileNamePart = Text
+End Function
+
+Private Function NormalizeSpaces(ByVal Text As String) As String
+    ' Collapses runs of whitespace into a single space.
+    ' Different from SanitizeFileNamePart - no char stripping.
+    ' Bounded For loop instead of Do While so we can never hang.
+    LogStep "  NormalizeSpaces entry, inLen=" & Len(Text)
+    On Error Resume Next
+    Text = Replace(Text, Chr(9), " ")      ' tab
+    Text = Replace(Text, Chr(10), " ")     ' LF
+    Text = Replace(Text, Chr(11), " ")     ' VT
+    Text = Replace(Text, Chr(12), " ")     ' FF
+    Text = Replace(Text, Chr(13), " ")     ' CR
+    Text = Replace(Text, Chr(160), " ")    ' non-breaking space
+    Dim i As Long
+    For i = 1 To 50
+        If InStr(Text, "  ") = 0 Then Exit For
+        Text = Replace(Text, "  ", " ")
+    Next i
+    NormalizeSpaces = Trim$(Text)
+    LogStep "  NormalizeSpaces exit, outLen=" & Len(NormalizeSpaces) & " iter=" & (i - 1)
+    On Error GoTo 0
+End Function
+
+Private Function IsReservedFilename(ByVal Name As String) As Boolean
+    Dim reserved As Variant, r As Variant, upper As String
+    reserved = Array("CON", "PRN", "AUX", "NUL", _
+                     "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", _
+                     "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9")
+    upper = UCase(Name)
+    For Each r In reserved
+        If upper = r Then IsReservedFilename = True: Exit Function
+    Next r
+End Function
+
+Private Function SheetExists(wb As Workbook, sheetName As String) As Boolean
+    Dim s As Worksheet
+    On Error Resume Next
+    Set s = wb.Sheets(sheetName)
+    SheetExists = Not s Is Nothing
+    On Error GoTo 0
+End Function
+
+Private Function GetOrCreateAuditSheet(wb As Workbook) As Worksheet
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = wb.Sheets("Audit_Log")
+    On Error GoTo 0
+
+    If ws Is Nothing Then
+        Set ws = wb.Sheets.Add(After:=wb.Sheets(wb.Sheets.Count))
+        ws.Name = "Audit_Log"
+        ws.Cells(1, 1).Value = "Date & Time"
+        ws.Cells(1, 2).Value = "Analyst ID"
+        ws.Cells(1, 3).Value = "ECM Case ID"
+        ws.Cells(1, 4).Value = "Total Entities"
+        ws.Cells(1, 5).Value = "Total Searches"
+        ws.Cells(1, 6).Value = "Time Taken"
+        ws.Cells(1, 7).Value = "Tool Version"
+        ws.Cells(1, 8).Value = "Error Diagnostic"   ' Bucket 1 / A
+        With ws.Range("A1:H1")
+            .Font.Bold = True
+            .Interior.Color = RGB(0, 70, 127)
+            .Font.Color = RGB(255, 255, 255)
+        End With
+        ws.Columns("A:H").AutoFit
+    End If
+
+    ' Backfill col H header on older audit sheets (non-destructive)
+    If ws.Cells(1, 8).Value = "" Then
+        ws.Cells(1, 8).Value = "Error Diagnostic"
+        With ws.Range("H1")
+            .Font.Bold = True
+            .Interior.Color = RGB(0, 70, 127)
+            .Font.Color = RGB(255, 255, 255)
+        End With
+    End If
+
+    Set GetOrCreateAuditSheet = ws
+End Function
+
+'==================================================================
+' TIMING
+'==================================================================
+
+Private Function T(BaseSeconds As Single) As Single
+    Select Case TIMING_PROFILE
+        Case "FAST": T = BaseSeconds * 0.7
+        Case "SLOW": T = BaseSeconds * 1.5
+        Case Else:   T = BaseSeconds
+    End Select
+End Function
+
+Sub SmartWait(Seconds As Single, Optional IgnoreESC As Boolean = False)
+    Dim EndTime As Single
+    EndTime = Timer + Seconds
+    Do While Timer < EndTime
+        DoEvents
+        If Not IgnoreESC Then
+            If GetAsyncKeyState(27) <> 0 Then
+                bAbort = True
+                Exit Sub
+            End If
+        End If
+        ' Midnight rollover guard
+        If Timer < EndTime - 86000 Then EndTime = EndTime - 86400
+    Loop
+
+    If IgnoreESC Then GetAsyncKeyState 27   ' drain buffered ESC
+End Sub
