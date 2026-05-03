@@ -81,7 +81,7 @@ Private Const IDNO  As Long = 7
 ' Anything below CAPTCHA_SIZE_HINT is suspiciously small and flagged
 ' for a retry, since Google's interstitial/CAPTCHA pages tend to
 ' render tiny compared to a normal 100-result SERP.
-Private Const TOOL_VERSION As String = "2.5.7"
+Private Const TOOL_VERSION As String = "2.5.9"
 Private Const MIN_PDF_SIZE_BYTES As Long = 5120
 Private Const CAPTCHA_SIZE_HINT As Long = 80000
 
@@ -102,6 +102,11 @@ Private Const RETRY_COOLDOWN_SEC As Single = 5          ' pause before retrying,
 Private Const DISK_ABORT_GB As Double = 2
 Private Const DISK_WARN_GB As Double = 5
 
+' While the macro runs we briefly drop the priority of the usual CPU
+' hogs (Teams, Outlook, OneDrive) so Edge gets a cleaner run at the
+' 2 vCPUs. Flip to False if it ever causes trouble on a given VDI.
+Private Const TUNE_BACKGROUND_PRIORITIES As Boolean = True
+
 ' Shared tracker that every analyst's run ends up appending to.
 Private Const MASTER_PATH As String = _
     "https://cfsb-my.sharepoint.com/personal/msrivastava_cfsb_com/Documents/" & _
@@ -119,6 +124,10 @@ Private m_origAlerts As Boolean
 Private m_origCursor As XlMousePointer
 Private m_origPrintComm As Boolean
 Private m_runtimeApplied As Boolean
+
+' PIDs of processes we temporarily knocked down to BelowNormal, so
+' we know which ones to lift back to Normal at the end of the run.
+Private m_tunedPids As Collection
 
 ' Entry point. Wire this up to your macro button.
 Sub SearchAndSavePDF_Direct()
@@ -472,8 +481,14 @@ Sub SearchAndSavePDF_Direct()
 
     ' ---- Single dispatch across a shared worker pool ----
     If allTasks.Count > 0 Then
+        ' Reorder: heavy searches (Negative News, Name + Address) go
+        ' first so the inevitable slow tail ends up on fast tasks.
+        ' Stable within each weight bucket, so per-entity order is
+        ' preserved as much as possible.
+        Set allTasks = SortTasksHeaviestFirst(allTasks)
+
         Application.StatusBar = "OSINT: Queued " & allTasks.Count & " searches - dispatching..."
-        LogStep "SEARCH PHASE - queued " & allTasks.Count & " tasks across all entities"
+        LogStep "SEARCH PHASE - queued " & allTasks.Count & " tasks across all entities (heaviest first)"
         actualSearchCount = RunSearchBatch(allTasks, WshShell)
         If bAbort Then GoTo AbortProcess
     End If
@@ -763,10 +778,17 @@ Public Sub AutoPrepareRuntime()
 
     m_runtimeApplied = True
     On Error GoTo 0
+
+    TuneBackgroundApps
 End Sub
 
 Public Sub AutoRestoreRuntime()
     On Error Resume Next
+
+    ' Always try to restore priorities, even if Excel state wasn't
+    ' applied - a half-way failure still might have tuned a few PIDs.
+    RestoreBackgroundApps
+
     If Not m_runtimeApplied Then
         Application.StatusBar = False
         Exit Sub
@@ -784,6 +806,93 @@ Public Sub AutoRestoreRuntime()
 
     m_runtimeApplied = False
     On Error GoTo 0
+End Sub
+
+' Drop Teams / Outlook / OneDrive to BelowNormal so they stop
+' fighting Edge for the 2 vCPUs. Remembers the PIDs we actually
+' managed to change, so RestoreBackgroundApps can put them back.
+' Uses WMI, which is usable on locked-down VDIs without admin.
+' Silently no-ops if WMI is unavailable or the toggle is off.
+Private Sub TuneBackgroundApps()
+    If Not TUNE_BACKGROUND_PRIORITIES Then Exit Sub
+
+    Set m_tunedPids = New Collection
+    On Error Resume Next
+
+    Dim wmi As Object
+    Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+    If wmi Is Nothing Then Exit Sub
+
+    ' Process names we want to de-prioritise. Upper/lower case
+    ' matches what Task Manager / WMI actually report.
+    Dim targets As Variant
+    targets = Array( _
+        "Teams.exe", "ms-teams.exe", "msteams.exe", _
+        "msedgewebview2.exe", _
+        "OUTLOOK.EXE", _
+        "OneDrive.exe")
+
+    Const PRIORITY_BELOW_NORMAL As Long = 16384
+    Dim target As Variant
+    Dim procs As Object, p As Object
+    Dim lowered As Long
+
+    For Each target In targets
+        Set procs = wmi.ExecQuery( _
+            "SELECT ProcessId FROM Win32_Process WHERE Name = '" & _
+            Replace(CStr(target), "'", "''") & "'")
+        If Not procs Is Nothing Then
+            For Each p In procs
+                If p.SetPriority(PRIORITY_BELOW_NORMAL) = 0 Then
+                    m_tunedPids.Add CLng(p.ProcessId)
+                    lowered = lowered + 1
+                End If
+            Next p
+        End If
+    Next target
+
+    If lowered > 0 Then
+        LogStep "BG TUNE: lowered " & lowered & " background process(es) to BelowNormal"
+    End If
+End Sub
+
+' Lifts every PID we tuned back to Normal. Processes that have
+' exited in the meantime are just ignored.
+Private Sub RestoreBackgroundApps()
+    If m_tunedPids Is Nothing Then Exit Sub
+    If m_tunedPids.Count = 0 Then
+        Set m_tunedPids = Nothing
+        Exit Sub
+    End If
+
+    On Error Resume Next
+
+    Dim wmi As Object
+    Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+    If wmi Is Nothing Then
+        Set m_tunedPids = Nothing
+        Exit Sub
+    End If
+
+    Const PRIORITY_NORMAL As Long = 32
+    Dim pid As Variant
+    Dim procs As Object, p As Object
+    Dim restored As Long
+
+    For Each pid In m_tunedPids
+        Set procs = wmi.ExecQuery( _
+            "SELECT ProcessId FROM Win32_Process WHERE ProcessId = " & CLng(pid))
+        If Not procs Is Nothing Then
+            For Each p In procs
+                If p.SetPriority(PRIORITY_NORMAL) = 0 Then
+                    restored = restored + 1
+                End If
+            Next p
+        End If
+    Next pid
+
+    LogStep "BG TUNE: restored " & restored & " background process(es) to Normal"
+    Set m_tunedPids = Nothing
 End Sub
 
 ' Fires a throwaway HEAD request to Google so the DNS + TLS
@@ -862,6 +971,70 @@ Public Function BuildEdgeArgs(ByVal url As String) As String
         "--renderer-process-limit=2 " & _
         "--no-first-run --no-default-browser-check --disable-sync --disable-extensions " & _
         "--lang=en-US """ & url & """"
+End Function
+
+' Reorders the task queue so the statistically heavier searches
+' run first. Based on past run logs the fat-tail outliers are
+' almost always "Negative News" queries (20-70 s each, vs 10-15 s
+' for a plain name search), so if they land at the end of the
+' queue one of the workers is stuck on a 60 s task while the other
+' sits idle. Launching them first means by the time we get to the
+' tail both workers are on short tasks and finish together.
+'
+' Stable sort - within a weight bucket, original order is kept so
+' per-entity ordering is mostly preserved.
+Private Function SortTasksHeaviestFirst(ByVal tasks As Collection) As Collection
+    Dim n As Long: n = tasks.Count
+    If n <= 1 Then
+        Set SortTasksHeaviestFirst = tasks
+        Exit Function
+    End If
+
+    Dim weights() As Long
+    Dim ordered() As Variant
+    ReDim weights(1 To n)
+    ReDim ordered(1 To n)
+
+    Dim i As Long, a As Variant, desc As String
+    For i = 1 To n
+        a = tasks(i)
+        desc = LCase$(CStr(a(3)))
+        Select Case True
+            Case InStr(desc, "negative news") > 0: weights(i) = 10
+            Case InStr(desc, "name + address") > 0: weights(i) = 5
+            Case Else:                              weights(i) = 1
+        End Select
+        ordered(i) = a
+    Next i
+
+    ' Insertion sort - descending, stable. n is small (under ~30).
+    Dim j As Long, wKey As Long, aKey As Variant
+    For i = 2 To n
+        wKey = weights(i)
+        aKey = ordered(i)
+        j = i - 1
+        Do While j >= 1
+            If weights(j) < wKey Then
+                weights(j + 1) = weights(j)
+                ordered(j + 1) = ordered(j)
+                j = j - 1
+            Else
+                Exit Do
+            End If
+        Loop
+        weights(j + 1) = wKey
+        ordered(j + 1) = aKey
+    Next i
+
+    Dim result As New Collection
+    For i = 1 To n
+        result.Add ordered(i)
+    Next i
+
+    LogStep "SORT: reordered " & n & " tasks (heavy first) - heaviest weight=" & _
+            weights(1) & ", lightest=" & weights(n)
+
+    Set SortTasksHeaviestFirst = result
 End Function
 
 ' ============================ Search engine ============================
@@ -1051,10 +1224,21 @@ Private Sub DispatchTaskPass(tasks As Collection, _
     Dim taskDurSec As Long
     Dim currLabel As String
 
+    ' Totals for "how long did the dispatcher sit idle" - lets us see
+    ' whether the sleep/stagger knobs are well-tuned.
+    Dim launchCount As Long: launchCount = 0
+    Dim somethingCompletedThisCycle As Boolean
+    Dim idleSleepMs As Long: idleSleepMs = 0
+
     LogStep "PASS [" & passLabel & "] start, n=" & n
 
     Do
-        ' Fill any free worker slots with pending tasks
+        somethingCompletedThisCycle = False
+
+        ' Fill any free worker slots with pending tasks. The launch
+        ' stagger only fires for the initial ramp-up: once every
+        ' worker has been launched once we stop staggering, so a
+        ' mid-batch completion gets an instant relaunch.
         For w = 0 To MAX_PARALLEL - 1
             If bAbort Then Exit For
             If Not busy(w) Then
@@ -1085,12 +1269,16 @@ Private Sub DispatchTaskPass(tasks As Collection, _
                         busy(w) = True
                         runningCount = runningCount + 1
                         pendingFound = True
+                        launchCount = launchCount + 1
 
                         LogStep "  TASK launch [" & i & "/" & n & "] w" & w & _
                                 " running=" & runningCount & _
                                 " [" & lbl(i) & "] " & dsc(i)
 
-                        SmartWait T(LAUNCH_STAGGER_SEC), True
+                        ' Stagger only during initial fill, not mid-batch.
+                        If launchCount <= MAX_PARALLEL Then
+                            SmartWait T(LAUNCH_STAGGER_SEC), True
+                        End If
                         Exit For
                     End If
                 Next i
@@ -1131,6 +1319,7 @@ Private Sub DispatchTaskPass(tasks As Collection, _
                     doneCount = doneCount + 1
                     runningCount = runningCount - 1
                     busy(wk(i)) = False
+                    somethingCompletedThisCycle = True
                     taskDurSec = DateDiff("s", launchT(i), Now)
                     durSecArr(i) = taskDurSec
                     workerBusySec(wk(i)) = workerBusySec(wk(i)) + _
@@ -1171,6 +1360,7 @@ Private Sub DispatchTaskPass(tasks As Collection, _
                     doneCount = doneCount + 1
                     runningCount = runningCount - 1
                     busy(wk(i)) = False
+                    somethingCompletedThisCycle = True
                     workerBusySec(wk(i)) = workerBusySec(wk(i)) + _
                                            DateDiff("s", workerBusyT(wk(i)), Now)
                     durSecArr(i) = DateDiff("s", launchT(i), Now)
@@ -1211,7 +1401,14 @@ ContinuePollingTask:
         End If
 
         If bAbort Then Exit Do
-        SmartWait T(POLL_INTERVAL_SEC)
+
+        ' If a task just finished, loop back immediately so the launch
+        ' phase can push work onto the now-free worker without waiting
+        ' out a poll cycle. Only sleep when nothing changed this round.
+        If Not somethingCompletedThisCycle Then
+            SmartWait T(POLL_INTERVAL_SEC)
+            idleSleepMs = idleSleepMs + CLng(T(POLL_INTERVAL_SEC) * 1000)
+        End If
     Loop While doneCount < n
 
     ' End-of-pass stats: how were the task durations distributed,
@@ -1252,6 +1449,9 @@ ContinuePollingTask:
         LogStep "  UTIL w" & w & " busy=" & workerBusySec(w) & "s/" & passWallSec & _
                 "s = " & utilPct & "%"
     Next w
+    LogStep "  DISP [" & passLabel & "] launches=" & launchCount & _
+            " dispatcher-sleep=" & (idleSleepMs \ 1000) & "." & _
+            Format((idleSleepMs Mod 1000) \ 100, "0") & "s"
     Exit Sub
 Fail:
     LogStep "PASS [" & passLabel & "] FAIL err=" & Err.Number & " desc=" & Err.Description
