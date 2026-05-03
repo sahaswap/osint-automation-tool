@@ -1,7 +1,29 @@
 '==================================================================
-' OSINT AUTOMATION TOOL v2.5.0
+' OSINT AUTOMATION TOOL v2.5.2
 '
-' Changelog from v2.4.5:
+' Changelog v2.5.0 -> v2.5.2:
+'
+'   v2.5.1 (flag cleanup)
+'   - Stripped "--disable-features=...,VizDisplayCompositor,..."
+'     from the headless cmdline - it was forcing the slow legacy
+'     rasterizer and was the main perf regression vs v2.4.5.
+'   - Also dropped --disable-breakpad, --disable-translate,
+'     --disable-ipc-flooding-protection, --disable-hang-monitor
+'     (marginal or net-negative in our tests).
+'
+'   v2.5.2 (architecture + retry)
+'   - Cross-entity batching: customer + all CP tasks are added to
+'     ONE flat queue and dispatched through a single 3-worker pool.
+'     Old code drained the pool between entities (tail-idle); new
+'     code keeps all 3 workers saturated end-to-end.
+'   - CAPTCHA retry: after the initial pass, any task whose PDF is
+'     > MIN_PDF_SIZE_BYTES but < CAPTCHA_SIZE_HINT (150 KB) is
+'     retried once after a 15 s cooldown. Final success count is
+'     re-computed from actual on-disk sizes.
+'   - TIMING_PROFILE default switched to FAST (0.7x internal
+'     waits). Switch back to NORMAL if VDI shows instability.
+'
+' Changelog from v2.4.5 -> v2.5.0:
 '
 '  Bucket 1 - Correctness
 '  ----------------------
@@ -125,12 +147,12 @@ Private Const IDNO  As Long = 7
 '==================================================================
 ' MODULE CONSTANTS
 '==================================================================
-Private Const TOOL_VERSION As String = "2.5.0"
+Private Const TOOL_VERSION As String = "2.5.2"
 Private Const MIN_PDF_SIZE_BYTES As Long = 5120
 Private Const CAPTCHA_SIZE_HINT As Long = 150000   ' below this, likely CAPTCHA
 
 Private Const USE_HEADLESS As Boolean = True
-Private Const TIMING_PROFILE As String = "NORMAL"   ' FAST | NORMAL | SLOW
+Private Const TIMING_PROFILE As String = "FAST"     ' FAST | NORMAL | SLOW
 
 ' Parallel dispatch
 Private Const MAX_PARALLEL As Long = 3              ' workers per entity
@@ -209,7 +231,7 @@ Sub SearchAndSavePDF_Direct()
 
     Dim expectedHeaders As Variant, headerMsg As String
     Dim spSyncStatus As String      ' "OK" / "FAILED: ..." / "SKIPPED"
-    Dim custBatch As Collection, cpBatch As Collection
+    Dim allTasks As Collection
 
     '--------------------------------------------------------------
     ' INITIALIZATION
@@ -407,69 +429,67 @@ Sub SearchAndSavePDF_Direct()
     LogStep "SEARCH PHASE start - total entities to process: " & (IIf(custName <> "", 1, 0) + totalCPs)
 
     '--------------------------------------------------------------
-    ' STEP 5: Customer searches - build batch, run in parallel
+    ' STEP 5/6: Build ONE flat task queue across customer + all CPs
+    '           (v2.5.2 cross-entity batching: no tail-idle waste
+    '            between entities - workers always have work)
     '--------------------------------------------------------------
+    Set allTasks = New Collection
+    Application.StatusBar = "OSINT: Queueing searches..."
+
+    ' ---- Customer tasks ----
     If custName <> "" Then
         custLabel = "Customer (" & custName & ")"
-        Application.StatusBar = "OSINT: " & custLabel & " -> Queueing searches..."
-
-        Set custBatch = New Collection
         fileCounter = 1
 
-        custBatch.Add Array(custName, _
-                            mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Google.pdf", _
-                            1, "Google name")
+        allTasks.Add Array(custName, _
+                           mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Google.pdf", _
+                           1, "Google name", custLabel)
         fileCounter = fileCounter + 1
 
         If custAddr <> "" Then
-            custBatch.Add Array(custAddr, _
-                                mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Address.pdf", _
-                                1, "Address")
+            allTasks.Add Array(custAddr, _
+                               mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Address.pdf", _
+                               1, "Address", custLabel)
             fileCounter = fileCounter + 1
 
-            custBatch.Add Array(custName & " + " & custAddr, _
-                                mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Google+Address.pdf", _
-                                1, "Name + Address")
+            allTasks.Add Array(custName & " + " & custAddr, _
+                               mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Google+Address.pdf", _
+                               1, "Name + Address", custLabel)
             fileCounter = fileCounter + 1
         End If
 
         If Trim(additionalCustAddr) <> "" Then
-            custBatch.Add Array(custName & " + " & additionalCustAddr, _
-                                mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Name+Additional Address.pdf", _
-                                1, "Name + Additional Address")
+            allTasks.Add Array(custName & " + " & additionalCustAddr, _
+                               mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Name+Additional Address.pdf", _
+                               1, "Name + Additional Address", custLabel)
             fileCounter = fileCounter + 1
         End If
 
         If Trim(custNameNegNews) <> "" Then
-            custBatch.Add Array("""" & custNameNegNews & """" & negWords, _
-                                mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Negative News 1.pdf", _
-                                1, "Negative News page 1")
+            allTasks.Add Array("""" & custNameNegNews & """" & negWords, _
+                               mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Negative News 1.pdf", _
+                               1, "Negative News page 1", custLabel)
             fileCounter = fileCounter + 1
-            custBatch.Add Array("""" & custNameNegNews & """" & negWords, _
-                                mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Negative News 2.pdf", _
-                                2, "Negative News page 2")
+            allTasks.Add Array("""" & custNameNegNews & """" & negWords, _
+                               mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Negative News 2.pdf", _
+                               2, "Negative News page 2", custLabel)
             fileCounter = fileCounter + 1
         End If
 
         If Trim(custNameNegNewsNoMiddle) <> "" And _
            StrComp(custNameNegNewsNoMiddle, custNameNegNews, vbTextCompare) <> 0 Then
-            custBatch.Add Array("""" & custNameNegNewsNoMiddle & """" & negWords, _
-                                mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Negative News 3.pdf", _
-                                1, "Negative News w/o middle, page 1")
+            allTasks.Add Array("""" & custNameNegNewsNoMiddle & """" & negWords, _
+                               mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Negative News 3.pdf", _
+                               1, "Negative News w/o middle, page 1", custLabel)
             fileCounter = fileCounter + 1
-            custBatch.Add Array("""" & custNameNegNewsNoMiddle & """" & negWords, _
-                                mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Negative News 4.pdf", _
-                                2, "Negative News w/o middle, page 2")
+            allTasks.Add Array("""" & custNameNegNewsNoMiddle & """" & negWords, _
+                               mainFolderPath & "\" & baseFileName & "_Customer_" & fileCounter & "_Negative News 4.pdf", _
+                               2, "Negative News w/o middle, page 2", custLabel)
             fileCounter = fileCounter + 1
         End If
-
-        actualSearchCount = actualSearchCount + RunSearchBatch(custBatch, custLabel, WshShell)
-        If bAbort Then GoTo AbortProcess
     End If
 
-    '--------------------------------------------------------------
-    ' STEP 6: Counterparty searches - one parallel batch per CP
-    '--------------------------------------------------------------
+    ' ---- Counterparty tasks (appended to same queue) ----
     cpLoopPosition = 0
     For i = 19 To 24
         cpName = SanitizeFileNamePart(Trim(CStr(ws.Range("J" & i).Value)))
@@ -478,55 +498,57 @@ Sub SearchAndSavePDF_Direct()
         If cpName <> "" Then
             cpLoopPosition = cpLoopPosition + 1
             cpLabel = "CP " & cpLoopPosition & " of " & totalCPs & " (" & cpName & ")"
-            Application.StatusBar = "OSINT: " & cpLabel & " -> Queueing searches..."
-
-            Set cpBatch = New Collection
             fileCounter = 1
 
-            cpBatch.Add Array(cpName, _
-                              mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Google.pdf", _
-                              1, "Google name")
+            allTasks.Add Array(cpName, _
+                               mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Google.pdf", _
+                               1, "Google name", cpLabel)
             fileCounter = fileCounter + 1
 
             If cpAddr <> "" Then
-                cpBatch.Add Array(cpAddr, _
-                                  mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Address.pdf", _
-                                  1, "Address")
+                allTasks.Add Array(cpAddr, _
+                                   mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Address.pdf", _
+                                   1, "Address", cpLabel)
                 fileCounter = fileCounter + 1
 
-                cpBatch.Add Array(cpName & " + " & cpAddr, _
-                                  mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Google+Address.pdf", _
-                                  1, "Name + Address")
+                allTasks.Add Array(cpName & " + " & cpAddr, _
+                                   mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Google+Address.pdf", _
+                                   1, "Name + Address", cpLabel)
                 fileCounter = fileCounter + 1
             End If
 
             If Trim(cpNameNegNews(i)) <> "" Then
-                cpBatch.Add Array("""" & cpNameNegNews(i) & """" & negWords, _
-                                  mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Negative News 1.pdf", _
-                                  1, "Negative News page 1")
+                allTasks.Add Array("""" & cpNameNegNews(i) & """" & negWords, _
+                                   mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Negative News 1.pdf", _
+                                   1, "Negative News page 1", cpLabel)
                 fileCounter = fileCounter + 1
-                cpBatch.Add Array("""" & cpNameNegNews(i) & """" & negWords, _
-                                  mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Negative News 2.pdf", _
-                                  2, "Negative News page 2")
+                allTasks.Add Array("""" & cpNameNegNews(i) & """" & negWords, _
+                                   mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Negative News 2.pdf", _
+                                   2, "Negative News page 2", cpLabel)
                 fileCounter = fileCounter + 1
             End If
 
             If Trim(cpNameNegNewsNoMiddle(i)) <> "" And _
                StrComp(cpNameNegNewsNoMiddle(i), cpNameNegNews(i), vbTextCompare) <> 0 Then
-                cpBatch.Add Array("""" & cpNameNegNewsNoMiddle(i) & """" & negWords, _
-                                  mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Negative News 3.pdf", _
-                                  1, "Negative News w/o middle, page 1")
+                allTasks.Add Array("""" & cpNameNegNewsNoMiddle(i) & """" & negWords, _
+                                   mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Negative News 3.pdf", _
+                                   1, "Negative News w/o middle, page 1", cpLabel)
                 fileCounter = fileCounter + 1
-                cpBatch.Add Array("""" & cpNameNegNewsNoMiddle(i) & """" & negWords, _
-                                  mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Negative News 4.pdf", _
-                                  2, "Negative News w/o middle, page 2")
+                allTasks.Add Array("""" & cpNameNegNewsNoMiddle(i) & """" & negWords, _
+                                   mainFolderPath & "\" & baseFileName & "_CP" & (i - 18) & "_" & fileCounter & "_Negative News 4.pdf", _
+                                   2, "Negative News w/o middle, page 2", cpLabel)
                 fileCounter = fileCounter + 1
             End If
-
-            actualSearchCount = actualSearchCount + RunSearchBatch(cpBatch, cpLabel, WshShell)
-            If bAbort Then GoTo AbortProcess
         End If
     Next i
+
+    ' ---- Single dispatch across a shared worker pool ----
+    If allTasks.Count > 0 Then
+        Application.StatusBar = "OSINT: Queued " & allTasks.Count & " searches - dispatching..."
+        LogStep "SEARCH PHASE - queued " & allTasks.Count & " tasks across all entities"
+        actualSearchCount = RunSearchBatch(allTasks, WshShell)
+        If bAbort Then GoTo AbortProcess
+    End If
 
     '--------------------------------------------------------------
     ' STEP 7: Elapsed time + entity count (midnight-safe)
@@ -932,41 +954,110 @@ Public Function BuildEdgeArgs(ByVal url As String) As String
 End Function
 
 '==================================================================
-' PARALLEL SEARCH DISPATCH (Bucket 3)
+' PARALLEL SEARCH DISPATCH (Bucket 3, v2.5.2 with cross-entity batching + CAPTCHA retry)
 '==================================================================
 
-' Runs a collection of search tasks.
-' Each task is Array(query, savePath, pageNum, description).
-' In headless mode: up to MAX_PARALLEL concurrent msedge.exe.
+' Runs a flat collection of search tasks.
+' Each task is Array(query, savePath, pageNum, description, entityLabel).
+' In headless mode: up to MAX_PARALLEL concurrent msedge.exe across
+' ALL tasks (cross-entity); workers never sit idle between entities.
+' Small PDFs (possible CAPTCHAs) get one automatic retry after a 15s
+' cooldown, using the same worker pool.
 ' In interactive mode: serial (one at a time).
-' Returns the count of tasks that produced a valid PDF.
-Private Function RunSearchBatch(tasks As Collection, _
-                                entityLabel As String, _
-                                wsh As Object) As Long
+' Returns the count of tasks that produced a valid PDF on disk.
+Private Function RunSearchBatch(tasks As Collection, wsh As Object) As Long
     If tasks Is Nothing Then Exit Function
     If tasks.Count = 0 Then Exit Function
 
     If USE_HEADLESS Then
-        RunSearchBatch = RunSearchBatchParallel(tasks, entityLabel, wsh)
+        RunSearchBatch = RunSearchBatchParallel(tasks, wsh)
     Else
-        RunSearchBatch = RunSearchBatchSerial(tasks, entityLabel, wsh)
+        RunSearchBatch = RunSearchBatchSerial(tasks, wsh)
     End If
 End Function
 
-Private Function RunSearchBatchParallel(tasks As Collection, _
-                                        entityLabel As String, _
-                                        wsh As Object) As Long
-    On Error GoTo Fail
+Private Function RunSearchBatchParallel(tasks As Collection, wsh As Object) As Long
+    On Error Resume Next
 
     Dim n As Long: n = tasks.Count
     If n = 0 Then Exit Function
 
-    Dim qry() As String, pth() As String, pg() As Long, dsc() As String
+    Dim batchStartT As Single: batchStartT = Timer
+    LogStep "BATCH ALL start, n=" & n & ", maxParallel=" & MAX_PARALLEL
+
+    ' ---------- Pass 1: initial dispatch ----------
+    Dim initialSizes() As Long
+    DispatchTaskPass tasks, wsh, "initial", initialSizes
+
+    ' Build retry collection from tasks that produced a suspiciously
+    ' small PDF (valid-ish size, but probably a CAPTCHA page).
+    Dim retryList As Collection
+    Set retryList = New Collection
+
+    Dim i As Long, a As Variant
+    For i = 1 To n
+        If i <= UBound(initialSizes) Then
+            If initialSizes(i) > MIN_PDF_SIZE_BYTES And _
+               initialSizes(i) < CAPTCHA_SIZE_HINT Then
+                retryList.Add tasks(i)
+            End If
+        End If
+    Next i
+
+    ' ---------- Pass 2: CAPTCHA retry after cooldown ----------
+    If retryList.Count > 0 And Not bAbort Then
+        LogStep "CAPTCHA COOLDOWN: " & retryList.Count & _
+                " tasks flagged - waiting 15s before retry"
+        Application.StatusBar = "OSINT: CAPTCHA cooldown (" & retryList.Count & _
+                                " tasks) - waiting 15s before retry..."
+        SmartWait 15, False  ' ESC still works during cooldown
+
+        If Not bAbort Then
+            Dim retrySizes() As Long
+            DispatchTaskPass retryList, wsh, "retry", retrySizes
+        End If
+    End If
+
+    ' ---------- Final count: actual valid PDFs on disk ----------
+    Dim finalSuccess As Long
+    For i = 1 To n
+        a = tasks(i)
+        On Error Resume Next
+        If FileLen(CStr(a(1))) > MIN_PDF_SIZE_BYTES Then
+            finalSuccess = finalSuccess + 1
+        End If
+        On Error GoTo 0
+    Next i
+
+    LogStep "BATCH ALL end, success=" & finalSuccess & "/" & n & _
+            " wall=" & CLng(Timer - batchStartT) & "s retries=" & retryList.Count
+
+    RunSearchBatchParallel = finalSuccess
+End Function
+
+' Single-pass parallel dispatch over a tasks collection.
+' Fills finalSizes(1..n) with the on-disk size after each task completes
+' (0 if failed/timed out). Caller uses this to decide whether to retry.
+Private Sub DispatchTaskPass(tasks As Collection, _
+                             wsh As Object, _
+                             ByVal passLabel As String, _
+                             ByRef finalSizes() As Long)
+    On Error GoTo Fail
+
+    Dim n As Long: n = tasks.Count
+    If n = 0 Then
+        ReDim finalSizes(1 To 1)  ' avoid uninitialised-array issues in caller
+        Exit Sub
+    End If
+
+    Dim qry() As String, pth() As String, pg() As Long
+    Dim dsc() As String, lbl() As String
     Dim st() As Long         ' 0=pending, 1=running, 2=done, 3=failed
-    Dim launchT() As Date    ' launch moment
-    Dim wk() As Long         ' worker slot used
-    ReDim qry(1 To n), pth(1 To n), pg(1 To n), dsc(1 To n)
+    Dim launchT() As Date
+    Dim wk() As Long
+    ReDim qry(1 To n), pth(1 To n), pg(1 To n), dsc(1 To n), lbl(1 To n)
     ReDim st(1 To n), launchT(1 To n), wk(1 To n)
+    ReDim finalSizes(1 To n)
 
     Dim i As Long, a As Variant
     For i = 1 To n
@@ -975,6 +1066,7 @@ Private Function RunSearchBatchParallel(tasks As Collection, _
         pth(i) = CStr(a(1))
         pg(i) = CLng(a(2))
         dsc(i) = CStr(a(3))
+        If UBound(a) >= 4 Then lbl(i) = CStr(a(4)) Else lbl(i) = ""
     Next i
 
     Dim busy() As Boolean
@@ -984,28 +1076,26 @@ Private Function RunSearchBatchParallel(tasks As Collection, _
     Dim w As Long, pendingFound As Boolean
     Dim cmd As String
     Dim sz As Long
-    Dim batchStartT As Single: batchStartT = Timer
+    Dim passStartT As Single: passStartT = Timer
     Dim taskDurSec As Long
+    Dim currLabel As String
 
-    LogStep "BATCH [" & entityLabel & "] start, n=" & n & ", maxParallel=" & MAX_PARALLEL
+    LogStep "PASS [" & passLabel & "] start, n=" & n
 
     Do
         ' Fill any free worker slots with pending tasks
         For w = 0 To MAX_PARALLEL - 1
-            If bAbort Then Exit For   ' stop dispatching as soon as ESC is seen
+            If bAbort Then Exit For
             If Not busy(w) Then
                 pendingFound = False
                 For i = 1 To n
                     If bAbort Then Exit For
                     If st(i) = 0 Then
-                        ' Clear any stale file (rerun / OneDrive leftover)
                         On Error Resume Next
                         If Dir(pth(i)) <> "" Then Kill pth(i)
                         On Error GoTo Fail
 
                         cmd = BuildHeadlessEdgeCmd(qry(i), pth(i), pg(i), w)
-
-                        ' Non-blocking launch: Run(cmd, windowStyle, waitOnReturn=False)
                         wsh.Run cmd, 0, False
 
                         st(i) = 1
@@ -1016,13 +1106,14 @@ Private Function RunSearchBatchParallel(tasks As Collection, _
                         pendingFound = True
 
                         LogStep "  TASK launch [" & i & "/" & n & "] w" & w & _
-                                " running=" & runningCount & " desc=" & dsc(i)
+                                " running=" & runningCount & _
+                                " [" & lbl(i) & "] " & dsc(i)
 
                         SmartWait T(LAUNCH_STAGGER_SEC), True
                         Exit For
                     End If
                 Next i
-                If Not pendingFound Then Exit For  ' queue empty
+                If Not pendingFound Then Exit For
             End If
         Next w
 
@@ -1038,61 +1129,66 @@ Private Function RunSearchBatchParallel(tasks As Collection, _
 
                 If sz > MIN_PDF_SIZE_BYTES Then
                     st(i) = 2
+                    finalSizes(i) = sz
                     successCount = successCount + 1
                     doneCount = doneCount + 1
                     runningCount = runningCount - 1
                     busy(wk(i)) = False
                     taskDurSec = DateDiff("s", launchT(i), Now)
+                    currLabel = lbl(i)
 
                     LogStep "  TASK done  [" & i & "/" & n & "] w" & wk(i) & _
                             " dur=" & taskDurSec & "s size=" & sz & "B running=" & runningCount
 
                     If sz < CAPTCHA_SIZE_HINT Then
                         LogStep "  TASK warn  [" & i & "/" & n & "] small PDF " & sz & _
-                                "B (possible CAPTCHA) - " & dsc(i)
+                                "B (possible CAPTCHA) - [" & lbl(i) & "] " & dsc(i)
                     End If
 
                 ElseIf DateDiff("s", launchT(i), Now) > TASK_TIMEOUT_SEC Then
                     st(i) = 3
+                    finalSizes(i) = 0
                     doneCount = doneCount + 1
                     runningCount = runningCount - 1
                     busy(wk(i)) = False
                     LogStep "  TASK TIMEOUT [" & i & "/" & n & "] w" & wk(i) & _
-                            " after " & TASK_TIMEOUT_SEC & "s - " & dsc(i)
+                            " after " & TASK_TIMEOUT_SEC & "s - [" & lbl(i) & "] " & dsc(i)
                 End If
             End If
         Next i
 
-        ' Status bar: aggregate progress for this entity
-        Application.StatusBar = "OSINT: " & entityLabel & " - " & _
-            doneCount & "/" & n & " saved, " & runningCount & " running"
+        ' Status bar: show pass + most-recent entity + progress
+        If currLabel <> "" Then
+            Application.StatusBar = "OSINT [" & passLabel & "]: " & currLabel & " - " & _
+                doneCount & "/" & n & " saved, " & runningCount & " running"
+        Else
+            Application.StatusBar = "OSINT [" & passLabel & "]: " & _
+                doneCount & "/" & n & " saved, " & runningCount & " running"
+        End If
 
         If bAbort Then Exit Do
         SmartWait T(POLL_INTERVAL_SEC)
     Loop While doneCount < n
 
-    LogStep "BATCH [" & entityLabel & "] end, success=" & successCount & "/" & n & _
-            " wall=" & CLng(Timer - batchStartT) & "s"
-
-    RunSearchBatchParallel = successCount
-    Exit Function
+    LogStep "PASS [" & passLabel & "] end, success=" & successCount & "/" & n & _
+            " wall=" & CLng(Timer - passStartT) & "s"
+    Exit Sub
 Fail:
-    ' On any unexpected error, return whatever succeeded so far.
-    ' The outer ErrorHandler will take over.
-    LogStep "BATCH [" & entityLabel & "] FAIL err=" & Err.Number & " desc=" & Err.Description
-    RunSearchBatchParallel = successCount
-End Function
+    LogStep "PASS [" & passLabel & "] FAIL err=" & Err.Number & " desc=" & Err.Description
+End Sub
 
-Private Function RunSearchBatchSerial(tasks As Collection, _
-                                      entityLabel As String, _
-                                      wsh As Object) As Long
+Private Function RunSearchBatchSerial(tasks As Collection, wsh As Object) As Long
     Dim n As Long: n = tasks.Count
     Dim i As Long, successCount As Long
     Dim a As Variant
+    Dim currLabel As String, currDesc As String
 
     For i = 1 To n
         a = tasks(i)
-        SetSearchStatus entityLabel, CStr(a(3)) & " (" & i & "/" & n & ")"
+        currDesc = CStr(a(3))
+        If UBound(a) >= 4 Then currLabel = CStr(a(4)) Else currLabel = "Search"
+
+        SetSearchStatus currLabel, currDesc & " (" & i & "/" & n & ")"
         If PrintSearchToPDF(CStr(a(0)), CStr(a(1)), wsh, CLng(a(2))) Then
             successCount = successCount + 1
         End If
