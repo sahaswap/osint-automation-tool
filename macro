@@ -147,15 +147,15 @@ Private Const IDNO  As Long = 7
 '==================================================================
 ' MODULE CONSTANTS
 '==================================================================
-Private Const TOOL_VERSION As String = "2.5.3"
+Private Const TOOL_VERSION As String = "2.5.5"
 Private Const MIN_PDF_SIZE_BYTES As Long = 5120
-Private Const CAPTCHA_SIZE_HINT As Long = 150000   ' below this, likely CAPTCHA
+Private Const CAPTCHA_SIZE_HINT As Long = 80000    ' below this, likely CAPTCHA (real legit PDFs can be ~125 KB)
 
 Private Const USE_HEADLESS As Boolean = True
 Private Const TIMING_PROFILE As String = "FAST"     ' FAST | NORMAL | SLOW
 
 ' Parallel dispatch
-Private Const MAX_PARALLEL As Long = 3              ' workers per entity
+Private Const MAX_PARALLEL As Long = 2              ' workers per pool (2-vCPU VDI: 2 beats 3 due to CPU contention)
 Private Const LAUNCH_STAGGER_SEC As Single = 0.4    ' gap between concurrent launches
 Private Const POLL_INTERVAL_SEC As Single = 0.3     ' sleep between completion checks
 Private Const TASK_TIMEOUT_SEC As Long = 90         ' per-task safety net (raised for VDI tail latency)
@@ -994,15 +994,19 @@ Private Function RunSearchBatchParallel(tasks As Collection, wsh As Object) As L
     Dim retryList As Collection
     Set retryList = New Collection
 
-    ' v2.5.3: retry ANY task whose first attempt did not produce a
-    ' full-size PDF. Includes:
-    '   size = 0          (timeout - file never created)
-    '   size <= MIN       (stub/corrupt)
-    '   size < CAPTCHA    (likely CAPTCHA page)
+    ' v2.5.4: retry ONLY real failures, not every small-but-valid PDF.
+    ' Two retry conditions:
+    '   (a) file missing or empty (size = 0) -> timeout / Edge crash
+    '   (b) MIN < size < CAPTCHA_HINT       -> stub or CAPTCHA page
+    ' A normal Google SERP PDF is 150-500 KB so the upper threshold
+    ' (CAPTCHA_SIZE_HINT = 150 KB) flags only suspicious small pages.
     Dim i As Long, a As Variant
     For i = 1 To n
         If i <= UBound(initialSizes) Then
-            If initialSizes(i) < CAPTCHA_SIZE_HINT Then
+            If initialSizes(i) <= 0 Then
+                retryList.Add tasks(i)
+            ElseIf initialSizes(i) > MIN_PDF_SIZE_BYTES And _
+                   initialSizes(i) < CAPTCHA_SIZE_HINT Then
                 retryList.Add tasks(i)
             End If
         End If
@@ -1018,7 +1022,8 @@ Private Function RunSearchBatchParallel(tasks As Collection, wsh As Object) As L
 
         If Not bAbort Then
             Dim retrySizes() As Long
-            DispatchTaskPass retryList, wsh, "retry", retrySizes
+            ' v2.5.5: preserveExisting=True -> don't kill borderline PDFs
+            DispatchTaskPass retryList, wsh, "retry", retrySizes, True
         End If
     End If
 
@@ -1042,10 +1047,13 @@ End Function
 ' Single-pass parallel dispatch over a tasks collection.
 ' Fills finalSizes(1..n) with the on-disk size after each task completes
 ' (0 if failed/timed out). Caller uses this to decide whether to retry.
+' preserveExisting: if True (retry pass), do NOT delete the existing
+' file before re-running - so if Edge fails we keep the borderline PDF.
 Private Sub DispatchTaskPass(tasks As Collection, _
                              wsh As Object, _
                              ByVal passLabel As String, _
-                             ByRef finalSizes() As Long)
+                             ByRef finalSizes() As Long, _
+                             Optional ByVal preserveExisting As Boolean = False)
     On Error GoTo Fail
 
     Dim n As Long: n = tasks.Count
@@ -1095,9 +1103,14 @@ Private Sub DispatchTaskPass(tasks As Collection, _
                 For i = 1 To n
                     If bAbort Then Exit For
                     If st(i) = 0 Then
-                        On Error Resume Next
-                        If Dir(pth(i)) <> "" Then Kill pth(i)
-                        On Error GoTo Fail
+                        ' v2.5.5: only delete stale file on initial pass.
+                        ' On retry we preserve borderline PDFs in case
+                        ' Edge fails - we lose no ground.
+                        If Not preserveExisting Then
+                            On Error Resume Next
+                            If Dir(pth(i)) <> "" Then Kill pth(i)
+                            On Error GoTo Fail
+                        End If
 
                         cmd = BuildHeadlessEdgeCmd(qry(i), pth(i), pg(i), w)
                         wsh.Run cmd, 0, False
@@ -1302,7 +1315,9 @@ Private Function BuildHeadlessEdgeCmd(ByVal Query As String, _
     s = s & " --mute-audio"
     s = s & " --hide-scrollbars"
     s = s & " --no-pings"
-    s = s & " --virtual-time-budget=10000"   ' v2.5.3: cap JS wait at 10s
+    ' v2.5.4: virtual-time-budget REMOVED again. On Google SERP it was
+    ' truncating layout at 10s -> small PDFs -> every task retried ->
+    ' ~6 min runs. v2.4.5 worked fine without it.
     s = s & " --print-to-pdf=""" & savePath & """"
     s = s & " """ & baseURL & """"
 
