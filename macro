@@ -404,6 +404,7 @@ Sub SearchAndSavePDF_Direct()
 
     AutoPrepareRuntime
     StartTime = Now
+    LogStep "SEARCH PHASE start - total entities to process: " & (IIf(custName <> "", 1, 0) + totalCPs)
 
     '--------------------------------------------------------------
     ' STEP 5: Customer searches - build batch, run in parallel
@@ -533,6 +534,7 @@ Sub SearchAndSavePDF_Direct()
     ElapsedSeconds = DateDiff("s", StartTime, Now)
     Minutes = ElapsedSeconds \ 60
     Seconds = ElapsedSeconds Mod 60
+    LogStep "SEARCH PHASE end - elapsed=" & ElapsedSeconds & "s, searches=" & actualSearchCount
     If Minutes > 0 Then
         timeString = Minutes & " minute(s) and " & Seconds & " second(s)"
     Else
@@ -982,6 +984,10 @@ Private Function RunSearchBatchParallel(tasks As Collection, _
     Dim w As Long, pendingFound As Boolean
     Dim cmd As String
     Dim sz As Long
+    Dim batchStartT As Single: batchStartT = Timer
+    Dim taskDurSec As Long
+
+    LogStep "BATCH [" & entityLabel & "] start, n=" & n & ", maxParallel=" & MAX_PARALLEL
 
     Do
         ' Fill any free worker slots with pending tasks
@@ -1009,6 +1015,9 @@ Private Function RunSearchBatchParallel(tasks As Collection, _
                         runningCount = runningCount + 1
                         pendingFound = True
 
+                        LogStep "  TASK launch [" & i & "/" & n & "] w" & w & _
+                                " running=" & runningCount & " desc=" & dsc(i)
+
                         SmartWait T(LAUNCH_STAGGER_SEC), True
                         Exit For
                     End If
@@ -1033,10 +1042,14 @@ Private Function RunSearchBatchParallel(tasks As Collection, _
                     doneCount = doneCount + 1
                     runningCount = runningCount - 1
                     busy(wk(i)) = False
+                    taskDurSec = DateDiff("s", launchT(i), Now)
+
+                    LogStep "  TASK done  [" & i & "/" & n & "] w" & wk(i) & _
+                            " dur=" & taskDurSec & "s size=" & sz & "B running=" & runningCount
 
                     If sz < CAPTCHA_SIZE_HINT Then
-                        Debug.Print "WARN: small PDF " & sz & "B (possible CAPTCHA) - " & _
-                                    dsc(i) & " -> " & pth(i)
+                        LogStep "  TASK warn  [" & i & "/" & n & "] small PDF " & sz & _
+                                "B (possible CAPTCHA) - " & dsc(i)
                     End If
 
                 ElseIf DateDiff("s", launchT(i), Now) > TASK_TIMEOUT_SEC Then
@@ -1044,7 +1057,8 @@ Private Function RunSearchBatchParallel(tasks As Collection, _
                     doneCount = doneCount + 1
                     runningCount = runningCount - 1
                     busy(wk(i)) = False
-                    Debug.Print "TIMEOUT: " & dsc(i) & " after " & TASK_TIMEOUT_SEC & "s"
+                    LogStep "  TASK TIMEOUT [" & i & "/" & n & "] w" & wk(i) & _
+                            " after " & TASK_TIMEOUT_SEC & "s - " & dsc(i)
                 End If
             End If
         Next i
@@ -1057,11 +1071,15 @@ Private Function RunSearchBatchParallel(tasks As Collection, _
         SmartWait T(POLL_INTERVAL_SEC)
     Loop While doneCount < n
 
+    LogStep "BATCH [" & entityLabel & "] end, success=" & successCount & "/" & n & _
+            " wall=" & CLng(Timer - batchStartT) & "s"
+
     RunSearchBatchParallel = successCount
     Exit Function
 Fail:
     ' On any unexpected error, return whatever succeeded so far.
     ' The outer ErrorHandler will take over.
+    LogStep "BATCH [" & entityLabel & "] FAIL err=" & Err.Number & " desc=" & Err.Description
     RunSearchBatchParallel = successCount
 End Function
 
@@ -1154,12 +1172,16 @@ Private Function BuildHeadlessEdgeCmd(ByVal Query As String, _
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " & _
          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
 
-    ' Build command in chunks to stay under VBA's 25-continuation limit.
-    ' --virtual-time-budget lets headless think 8s of JS timers have
-    ' elapsed immediately, so Google's lazy-loaded SERP content
-    ' resolves roughly 1s faster per search.
-    ' --no-pdf-header-footer is OMITTED on purpose so PDFs include
-    ' default Edge headers/footers (title, date, URL, page #).
+    ' v2.5.1: stripped back to match v2.4.5 + only safe micro-optimizations.
+    ' Removed (were hurting perf or had zero benefit):
+    '   --disable-features=...,VizDisplayCompositor,...  (forces slow
+    '     legacy rasterizer - primary perf regression vs v2.4.5)
+    '   --disable-breakpad, --disable-translate,
+    '   --disable-ipc-flooding-protection, --disable-hang-monitor
+    '     (marginal or negative impact)
+    ' Kept: the v2.4.5 baseline + audio/scrollbars/pings/sync/
+    ' component-update/default-apps/metrics/phishing (all safe).
+    ' --no-pdf-header-footer OMITTED on purpose (keep default headers).
     s = """" & edgeExe & """"
     s = s & " --headless=new"
     s = s & " --disable-gpu"
@@ -1172,23 +1194,14 @@ Private Function BuildHeadlessEdgeCmd(ByVal Query As String, _
     s = s & " --no-default-browser-check"
     s = s & " --disable-logging --log-level=3"
     s = s & " --disable-background-networking"
-    s = s & " --disable-breakpad"
-    s = s & " --disable-component-update"
-    s = s & " --disable-default-apps"
-    s = s & " --disable-hang-monitor"
-    s = s & " --disable-ipc-flooding-protection"
-    s = s & " --disable-translate"
     s = s & " --disable-sync"
+    s = s & " --disable-default-apps"
+    s = s & " --disable-component-update"
     s = s & " --disable-client-side-phishing-detection"
-    s = s & " --disable-features=Translate,BlinkGenPropertyTrees,CalculateNativeWinOcclusion,VizDisplayCompositor"
     s = s & " --metrics-recording-only"
     s = s & " --mute-audio"
     s = s & " --hide-scrollbars"
     s = s & " --no-pings"
-    ' NOTE: --virtual-time-budget removed - it conflicted with
-    ' --headless=new + --print-to-pdf on some Edge builds, causing
-    ' Edge to render but never exit. --password-store / --use-mock-keychain
-    ' are Linux-oriented and ignored (or worse) on Windows Edge.
     s = s & " --print-to-pdf=""" & savePath & """"
     s = s & " """ & baseURL & """"
 
