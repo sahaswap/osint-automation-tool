@@ -147,7 +147,7 @@ Private Const IDNO  As Long = 7
 '==================================================================
 ' MODULE CONSTANTS
 '==================================================================
-Private Const TOOL_VERSION As String = "2.5.5"
+Private Const TOOL_VERSION As String = "2.5.6"
 Private Const MIN_PDF_SIZE_BYTES As Long = 5120
 Private Const CAPTCHA_SIZE_HINT As Long = 80000    ' below this, likely CAPTCHA (real legit PDFs can be ~125 KB)
 
@@ -155,10 +155,12 @@ Private Const USE_HEADLESS As Boolean = True
 Private Const TIMING_PROFILE As String = "FAST"     ' FAST | NORMAL | SLOW
 
 ' Parallel dispatch
-Private Const MAX_PARALLEL As Long = 2              ' workers per pool (2-vCPU VDI: 2 beats 3 due to CPU contention)
-Private Const LAUNCH_STAGGER_SEC As Single = 0.4    ' gap between concurrent launches
+Private Const MAX_PARALLEL As Long = 3              ' workers per pool
+Private Const LAUNCH_STAGGER_SEC As Single = 0.25   ' gap between concurrent launches
 Private Const POLL_INTERVAL_SEC As Single = 0.3     ' sleep between completion checks
-Private Const TASK_TIMEOUT_SEC As Long = 90         ' per-task safety net (raised for VDI tail latency)
+Private Const TASK_TIMEOUT_SEC As Long = 45         ' initial pass timeout
+Private Const RETRY_TIMEOUT_SEC As Long = 60        ' retry/rescue pass timeout
+Private Const RETRY_COOLDOWN_SEC As Single = 5      ' short cooldown before retry
 
 ' Disk thresholds (GB)
 Private Const DISK_ABORT_GB As Double = 2
@@ -987,7 +989,7 @@ Private Function RunSearchBatchParallel(tasks As Collection, wsh As Object) As L
 
     ' ---------- Pass 1: initial dispatch ----------
     Dim initialSizes() As Long
-    DispatchTaskPass tasks, wsh, "initial", initialSizes
+    DispatchTaskPass tasks, wsh, "initial", initialSizes, False, TASK_TIMEOUT_SEC
 
     ' Build retry collection from tasks that produced a suspiciously
     ' small PDF (valid-ish size, but probably a CAPTCHA page).
@@ -1015,16 +1017,33 @@ Private Function RunSearchBatchParallel(tasks As Collection, wsh As Object) As L
     ' ---------- Pass 2: CAPTCHA retry after cooldown ----------
     If retryList.Count > 0 And Not bAbort Then
         LogStep "CAPTCHA COOLDOWN: " & retryList.Count & _
-                " tasks flagged - waiting 15s before retry"
+                " tasks flagged - waiting " & RETRY_COOLDOWN_SEC & "s before retry"
         Application.StatusBar = "OSINT: CAPTCHA cooldown (" & retryList.Count & _
-                                " tasks) - waiting 15s before retry..."
-        SmartWait 15, False  ' ESC still works during cooldown
+                                " tasks) - waiting " & RETRY_COOLDOWN_SEC & "s before retry..."
+        SmartWait RETRY_COOLDOWN_SEC, False  ' ESC still works during cooldown
 
         If Not bAbort Then
             Dim retrySizes() As Long
-            ' v2.5.5: preserveExisting=True -> don't kill borderline PDFs
-            DispatchTaskPass retryList, wsh, "retry", retrySizes, True
+            DispatchTaskPass retryList, wsh, "retry", retrySizes, True, RETRY_TIMEOUT_SEC
         End If
+    End If
+
+    Dim rescueList As Collection
+    Set rescueList = New Collection
+    For i = 1 To n
+        a = tasks(i)
+        On Error Resume Next
+        If Dir(CStr(a(1))) = "" Or FileLen(CStr(a(1))) <= MIN_PDF_SIZE_BYTES Then
+            rescueList.Add tasks(i)
+        End If
+        On Error GoTo 0
+    Next i
+
+    If rescueList.Count > 0 And Not bAbort Then
+        LogStep "RESCUE PASS: " & rescueList.Count & " files still missing - final retry"
+        Application.StatusBar = "OSINT: final rescue pass for " & rescueList.Count & " missing file(s)..."
+        Dim rescueSizes() As Long
+        DispatchTaskPass rescueList, wsh, "rescue", rescueSizes, True, RETRY_TIMEOUT_SEC
     End If
 
     ' ---------- Final count: actual valid PDFs on disk ----------
@@ -1053,7 +1072,8 @@ Private Sub DispatchTaskPass(tasks As Collection, _
                              wsh As Object, _
                              ByVal passLabel As String, _
                              ByRef finalSizes() As Long, _
-                             Optional ByVal preserveExisting As Boolean = False)
+                             Optional ByVal preserveExisting As Boolean = False, _
+                             Optional ByVal timeoutSeconds As Long = 0)
     On Error GoTo Fail
 
     Dim n As Long: n = tasks.Count
@@ -1064,11 +1084,18 @@ Private Sub DispatchTaskPass(tasks As Collection, _
 
     Dim qry() As String, pth() As String, pg() As Long
     Dim dsc() As String, lbl() As String
+    If timeoutSeconds <= 0 Then timeoutSeconds = TASK_TIMEOUT_SEC
+
     Dim st() As Long         ' 0=pending, 1=running, 2=done, 3=failed
     Dim launchT() As Date
     Dim wk() As Long
+    Dim bak() As String
+    Dim hadBackup() As Boolean
+    Dim lastSize() As Long
+    Dim stableHits() As Long
     ReDim qry(1 To n), pth(1 To n), pg(1 To n), dsc(1 To n), lbl(1 To n)
     ReDim st(1 To n), launchT(1 To n), wk(1 To n)
+    ReDim bak(1 To n), hadBackup(1 To n), lastSize(1 To n), stableHits(1 To n)
     ReDim finalSizes(1 To n)
 
     Dim i As Long, a As Variant
@@ -1103,14 +1130,18 @@ Private Sub DispatchTaskPass(tasks As Collection, _
                 For i = 1 To n
                     If bAbort Then Exit For
                     If st(i) = 0 Then
-                        ' v2.5.5: only delete stale file on initial pass.
-                        ' On retry we preserve borderline PDFs in case
-                        ' Edge fails - we lose no ground.
-                        If Not preserveExisting Then
-                            On Error Resume Next
+                        On Error Resume Next
+                        If preserveExisting Then
+                            bak(i) = pth(i) & ".retrybak"
+                            If Dir(bak(i)) <> "" Then Kill bak(i)
+                            If Dir(pth(i)) <> "" Then
+                                Name pth(i) As bak(i)
+                                hadBackup(i) = True
+                            End If
+                        Else
                             If Dir(pth(i)) <> "" Then Kill pth(i)
-                            On Error GoTo Fail
                         End If
+                        On Error GoTo Fail
 
                         cmd = BuildHeadlessEdgeCmd(qry(i), pth(i), pg(i), w)
                         wsh.Run cmd, 0, False
@@ -1145,6 +1176,15 @@ Private Sub DispatchTaskPass(tasks As Collection, _
                 End If
 
                 If sz > MIN_PDF_SIZE_BYTES Then
+                    If sz = lastSize(i) Then
+                        stableHits(i) = stableHits(i) + 1
+                    Else
+                        lastSize(i) = sz
+                        stableHits(i) = 0
+                    End If
+
+                    If stableHits(i) < 1 Then GoTo ContinuePollingTask
+
                     st(i) = 2
                     finalSizes(i) = sz
                     successCount = successCount + 1
@@ -1157,20 +1197,35 @@ Private Sub DispatchTaskPass(tasks As Collection, _
                     LogStep "  TASK done  [" & i & "/" & n & "] w" & wk(i) & _
                             " dur=" & taskDurSec & "s size=" & sz & "B running=" & runningCount
 
+                    If hadBackup(i) Then
+                        On Error Resume Next
+                        If Dir(bak(i)) <> "" Then Kill bak(i)
+                        On Error GoTo Fail
+                    End If
+
                     If sz < CAPTCHA_SIZE_HINT Then
                         LogStep "  TASK warn  [" & i & "/" & n & "] small PDF " & sz & _
                                 "B (possible CAPTCHA) - [" & lbl(i) & "] " & dsc(i)
                     End If
 
-                ElseIf DateDiff("s", launchT(i), Now) > TASK_TIMEOUT_SEC Then
+                ElseIf DateDiff("s", launchT(i), Now) > timeoutSeconds Then
                     st(i) = 3
                     finalSizes(i) = 0
                     doneCount = doneCount + 1
                     runningCount = runningCount - 1
                     busy(wk(i)) = False
+                    KillEdgeWorkerProcesses wk(i)
+                    If hadBackup(i) Then
+                        On Error Resume Next
+                        If Dir(pth(i)) <> "" Then Kill pth(i)
+                        If Dir(bak(i)) <> "" Then Name bak(i) As pth(i)
+                        If Dir(pth(i)) <> "" Then finalSizes(i) = FileLen(pth(i))
+                        On Error GoTo Fail
+                    End If
                     LogStep "  TASK TIMEOUT [" & i & "/" & n & "] w" & wk(i) & _
-                            " after " & TASK_TIMEOUT_SEC & "s - [" & lbl(i) & "] " & dsc(i)
+                            " after " & timeoutSeconds & "s - [" & lbl(i) & "] " & dsc(i)
                 End If
+ContinuePollingTask:
             End If
         Next i
 
@@ -1327,6 +1382,48 @@ End Function
 Private Function GetWorkerProfilePath(ByVal workerIdx As Long) As String
     GetWorkerProfilePath = Environ("LOCALAPPDATA") & "\OSINT_EdgeWorker_" & workerIdx
 End Function
+
+'------------------------------------------------------------------
+' v2.5.6: kill any msedge.exe instance whose command line references
+' OSINT_EdgeWorker_<idx>. Used after a TASK TIMEOUT to free the
+' worker profile lock so the next task can launch on the same slot
+' without colliding with a still-alive headless process.
+'
+' Uses WMI (winmgmts) which is allowed on locked-down VDIs without
+' admin rights. Fails silent if WMI is blocked.
+'------------------------------------------------------------------
+Private Sub KillEdgeWorkerProcesses(ByVal workerIdx As Long)
+    On Error Resume Next
+    Dim wmi As Object, procs As Object, p As Object
+    Dim profileName As String, cmdLine As String
+    Dim killed As Long
+
+    profileName = "OSINT_EdgeWorker_" & workerIdx
+
+    Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+    If wmi Is Nothing Then Exit Sub
+
+    Set procs = wmi.ExecQuery( _
+        "SELECT ProcessId, CommandLine FROM Win32_Process " & _
+        "WHERE Name = 'msedge.exe'")
+    If procs Is Nothing Then Exit Sub
+
+    killed = 0
+    For Each p In procs
+        cmdLine = ""
+        cmdLine = CStr(p.CommandLine)
+        If Len(cmdLine) > 0 And _
+           InStr(1, cmdLine, profileName, vbTextCompare) > 0 Then
+            p.Terminate
+            killed = killed + 1
+        End If
+    Next p
+
+    If killed > 0 Then
+        LogStep "  KILL w" & workerIdx & " - terminated " & killed & _
+                " orphan msedge.exe process(es)"
+    End If
+End Sub
 
 Private Function GetEdgePath() As String
     Dim candidates As Variant, p As Variant
