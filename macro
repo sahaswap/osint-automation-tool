@@ -81,7 +81,7 @@ Private Const IDNO  As Long = 7
 ' Anything below CAPTCHA_SIZE_HINT is suspiciously small and flagged
 ' for a retry, since Google's interstitial/CAPTCHA pages tend to
 ' render tiny compared to a normal 100-result SERP.
-Private Const TOOL_VERSION As String = "2.5.9"
+Private Const TOOL_VERSION As String = "2.5.10"
 Private Const MIN_PDF_SIZE_BYTES As Long = 5120
 Private Const CAPTCHA_SIZE_HINT As Long = 80000
 
@@ -96,7 +96,7 @@ Private Const LAUNCH_STAGGER_SEC As Single = 0.3        ' breathing room between
 Private Const POLL_INTERVAL_SEC As Single = 0.3         ' how often we check for a finished PDF
 Private Const TASK_TIMEOUT_SEC As Long = 75             ' kill a task that is clearly stuck
 Private Const RETRY_TIMEOUT_SEC As Long = 90            ' give retries a little more rope
-Private Const RETRY_COOLDOWN_SEC As Single = 5          ' pause before retrying, in case Google is rate-limiting
+Private Const RETRY_COOLDOWN_SEC As Single = 5          ' unused since v2.5.10 (inline retries) - kept in case Google rate-limiting forces a cooldown back in
 
 ' Leave the drive alone if it is running out of space.
 Private Const DISK_ABORT_GB As Double = 2
@@ -1046,7 +1046,9 @@ End Function
 ' once across the whole batch - there's no per-entity boundary, so
 ' workers are never idle while some other entity's tasks are still
 ' queued. Anything that comes back suspiciously small (probably a
-' CAPTCHA) gets one automatic retry after a brief cool-down.
+' CAPTCHA) or that times out gets one automatic retry, requeued
+' into the same pool so it overlaps the tail of the initial dispatch
+' instead of running as a sequential second pass.
 '
 ' In interactive mode we just run them one at a time.
 '
@@ -1071,44 +1073,21 @@ Private Function RunSearchBatchParallel(tasks As Collection, wsh As Object) As L
     Dim batchStartT As Single: batchStartT = Timer
     LogStep "BATCH ALL start, n=" & n & ", maxParallel=" & MAX_PARALLEL
 
-    ' First pass: run every task through the worker pool.
-    Dim initialSizes() As Long
-    DispatchTaskPass tasks, wsh, "initial", initialSizes, False, TASK_TIMEOUT_SEC
+    ' Single main pass with inline retries (max 1 per task). Tasks
+    ' that come back as CAPTCHA-size or that time out are requeued
+    ' into the same pool so the retry happens on the next free
+    ' worker - no separate pass, no 5 s cooldown, the work overlaps
+    ' the tail of the initial dispatch instead of being sequential.
+    Dim mainSizes() As Long
+    DispatchTaskPass tasks, wsh, "main", mainSizes, False, TASK_TIMEOUT_SEC, 1
 
-    ' Look at what came back. A task earns a retry only if it really
-    ' looks broken - either no file at all (crash or timeout) or a
-    ' suspiciously tiny one (CAPTCHA / interstitial). A normal Google
-    ' SERP PDF is comfortably over CAPTCHA_SIZE_HINT.
-    Dim retryList As Collection
-    Set retryList = New Collection
-    Dim i As Long, a As Variant
-    For i = 1 To n
-        If i <= UBound(initialSizes) Then
-            If initialSizes(i) <= 0 Then
-                retryList.Add tasks(i)
-            ElseIf initialSizes(i) > MIN_PDF_SIZE_BYTES And _
-                   initialSizes(i) < CAPTCHA_SIZE_HINT Then
-                retryList.Add tasks(i)
-            End If
-        End If
-    Next i
-
-    ' Second pass: short cooldown, then retry the bad ones.
-    If retryList.Count > 0 And Not bAbort Then
-        LogStep "CAPTCHA COOLDOWN: " & retryList.Count & _
-                " tasks flagged - waiting " & RETRY_COOLDOWN_SEC & "s before retry"
-        Application.StatusBar = "OSINT: CAPTCHA cooldown (" & retryList.Count & _
-                                " tasks) - waiting " & RETRY_COOLDOWN_SEC & "s before retry..."
-        SmartWait RETRY_COOLDOWN_SEC, False
-
-        If Not bAbort Then
-            Dim retrySizes() As Long
-            DispatchTaskPass retryList, wsh, "retry", retrySizes, True, RETRY_TIMEOUT_SEC
-        End If
-    End If
-
+    ' Rescue check: did anything still end up missing or sub-MIN?
+    ' Run those one more time at the longer retry timeout. This is
+    ' rare in practice (the inline retry already absorbed most of it)
+    ' but it's our final correctness net.
     Dim rescueList As Collection
     Set rescueList = New Collection
+    Dim i As Long, a As Variant
     For i = 1 To n
         a = tasks(i)
         On Error Resume Next
@@ -1122,11 +1101,11 @@ Private Function RunSearchBatchParallel(tasks As Collection, wsh As Object) As L
         LogStep "RESCUE PASS: " & rescueList.Count & " files still missing - final retry"
         Application.StatusBar = "OSINT: final rescue pass for " & rescueList.Count & " missing file(s)..."
         Dim rescueSizes() As Long
-        DispatchTaskPass rescueList, wsh, "rescue", rescueSizes, True, RETRY_TIMEOUT_SEC
+        DispatchTaskPass rescueList, wsh, "rescue", rescueSizes, True, RETRY_TIMEOUT_SEC, 0
     End If
 
-    ' Final tally is taken straight from disk - that way any of the
-    ' three passes getting the file to a good state gets counted.
+    ' Final tally is taken straight from disk - that way any retry
+    ' getting the file to a good state still gets counted.
     Dim finalSuccess As Long
     For i = 1 To n
         a = tasks(i)
@@ -1138,7 +1117,7 @@ Private Function RunSearchBatchParallel(tasks As Collection, wsh As Object) As L
     Next i
 
     LogStep "BATCH ALL end, success=" & finalSuccess & "/" & n & _
-            " wall=" & CLng(Timer - batchStartT) & "s retries=" & retryList.Count
+            " wall=" & CLng(Timer - batchStartT) & "s rescue=" & rescueList.Count
 
     RunSearchBatchParallel = finalSuccess
 End Function
@@ -1157,7 +1136,8 @@ Private Sub DispatchTaskPass(tasks As Collection, _
                              ByVal passLabel As String, _
                              ByRef finalSizes() As Long, _
                              Optional ByVal preserveExisting As Boolean = False, _
-                             Optional ByVal timeoutSeconds As Long = 0)
+                             Optional ByVal timeoutSeconds As Long = 0, _
+                             Optional ByVal maxRetries As Long = 0)
     On Error GoTo Fail
 
     Dim n As Long: n = tasks.Count
@@ -1189,10 +1169,11 @@ Private Sub DispatchTaskPass(tasks As Collection, _
     Dim lastSize() As Long
     Dim stableHits() As Long
     Dim durSecArr() As Long
+    Dim retriesUsed() As Long      ' how many retry attempts already burned per task
     ReDim qry(1 To n), pth(1 To n), pg(1 To n), dsc(1 To n), lbl(1 To n)
     ReDim st(1 To n), launchT(1 To n), firstSeenT(1 To n), wk(1 To n)
     ReDim bak(1 To n), hadBackup(1 To n), lastSize(1 To n), stableHits(1 To n)
-    ReDim durSecArr(1 To n)
+    ReDim durSecArr(1 To n), retriesUsed(1 To n)
     ReDim finalSizes(1 To n)
 
     ' Track how much of the pass each worker was actually busy -
@@ -1227,10 +1208,12 @@ Private Sub DispatchTaskPass(tasks As Collection, _
     ' Totals for "how long did the dispatcher sit idle" - lets us see
     ' whether the sleep/stagger knobs are well-tuned.
     Dim launchCount As Long: launchCount = 0
+    Dim retryCount As Long: retryCount = 0    ' inline-retry firings inside this pass
     Dim somethingCompletedThisCycle As Boolean
     Dim idleSleepMs As Long: idleSleepMs = 0
+    Dim taskTimeoutSec As Long
 
-    LogStep "PASS [" & passLabel & "] start, n=" & n
+    LogStep "PASS [" & passLabel & "] start, n=" & n & ", maxRetries=" & maxRetries
 
     Do
         somethingCompletedThisCycle = False
@@ -1313,6 +1296,32 @@ Private Sub DispatchTaskPass(tasks As Collection, _
 
                     If stableHits(i) < 1 Then GoTo ContinuePollingTask
 
+                    ' Tiny PDF on first attempt = almost certainly a
+                    ' CAPTCHA / interstitial. If we still have a retry
+                    ' available, requeue this task into the same pool
+                    ' (no separate retry pass, no cooldown). On the
+                    ' last allowed attempt we accept whatever we got.
+                    If sz < CAPTCHA_SIZE_HINT And retriesUsed(i) < maxRetries Then
+                        On Error Resume Next
+                        If Dir(pth(i)) <> "" Then Kill pth(i)
+                        On Error GoTo Fail
+
+                        workerBusySec(wk(i)) = workerBusySec(wk(i)) + _
+                                               DateDiff("s", workerBusyT(wk(i)), Now)
+                        st(i) = 0                       ' back to pending
+                        retriesUsed(i) = retriesUsed(i) + 1
+                        runningCount = runningCount - 1
+                        busy(wk(i)) = False
+                        somethingCompletedThisCycle = True
+                        retryCount = retryCount + 1
+                        firstSeenT(i) = #12:00:00 AM#   ' reset bookkeeping
+                        lastSize(i) = 0
+                        stableHits(i) = 0
+                        LogStep "  TASK retry [" & i & "/" & n & "] CAPTCHA-size " & sz & _
+                                "B - requeued (attempt " & (retriesUsed(i) + 1) & ")"
+                        GoTo ContinuePollingTask
+                    End If
+
                     st(i) = 2
                     finalSizes(i) = sz
                     successCount = successCount + 1
@@ -1351,41 +1360,77 @@ Private Sub DispatchTaskPass(tasks As Collection, _
 
                     If sz < CAPTCHA_SIZE_HINT Then
                         LogStep "  TASK warn  [" & i & "/" & n & "] small PDF " & sz & _
-                                "B (possible CAPTCHA) - [" & lbl(i) & "] " & dsc(i)
+                                "B (possible CAPTCHA, no retries left) - [" & lbl(i) & "] " & dsc(i)
                     End If
 
-                ElseIf DateDiff("s", launchT(i), Now) > timeoutSeconds Then
-                    st(i) = 3
-                    finalSizes(i) = 0
-                    doneCount = doneCount + 1
-                    runningCount = runningCount - 1
-                    busy(wk(i)) = False
-                    somethingCompletedThisCycle = True
-                    workerBusySec(wk(i)) = workerBusySec(wk(i)) + _
-                                           DateDiff("s", workerBusyT(wk(i)), Now)
-                    durSecArr(i) = DateDiff("s", launchT(i), Now)
-                    KillEdgeWorkerProcesses wk(i)
-                    If hadBackup(i) Then
-                        On Error Resume Next
-                        If Dir(pth(i)) <> "" Then Kill pth(i)
-                        If Dir(bak(i)) <> "" Then Name bak(i) As pth(i)
-                        If Dir(pth(i)) <> "" Then finalSizes(i) = FileLen(pth(i))
-                        On Error GoTo Fail
-                    End If
-
-                    ' Note whether Edge ever wrote anything. If not,
-                    ' the hang was at launch / navigation; if yes, the
-                    ' hang was during render or PDF write.
-                    Dim fileState As String
-                    If firstSeenT(i) = #12:00:00 AM# Then
-                        fileState = "NO FILE EVER"
+                Else
+                    ' Adaptive timeout: a task that's already been retried
+                    ' once gets the longer RETRY_TIMEOUT_SEC because
+                    ' those tend to be the genuinely-slow Google queries.
+                    If retriesUsed(i) > 0 Then
+                        taskTimeoutSec = RETRY_TIMEOUT_SEC
                     Else
-                        fileState = "file seen after " & _
-                                    DateDiff("s", launchT(i), firstSeenT(i)) & "s"
+                        taskTimeoutSec = timeoutSeconds
                     End If
-                    LogStep "  TASK TIMEOUT [" & i & "/" & n & "] w" & wk(i) & _
-                            " after " & timeoutSeconds & "s (" & fileState & _
-                            ") - [" & lbl(i) & "] " & dsc(i)
+
+                    If DateDiff("s", launchT(i), Now) > taskTimeoutSec Then
+                        ' Always free the worker first - the orphan
+                        ' Edge process needs killing whether we retry
+                        ' or give up.
+                        KillEdgeWorkerProcesses wk(i)
+                        workerBusySec(wk(i)) = workerBusySec(wk(i)) + _
+                                               DateDiff("s", workerBusyT(wk(i)), Now)
+                        durSecArr(i) = DateDiff("s", launchT(i), Now)
+
+                        Dim toFileState As String
+                        If firstSeenT(i) = #12:00:00 AM# Then
+                            toFileState = "NO FILE EVER"
+                        Else
+                            toFileState = "file seen after " & _
+                                          DateDiff("s", launchT(i), firstSeenT(i)) & "s"
+                        End If
+
+                        If retriesUsed(i) < maxRetries Then
+                            ' Inline retry: drop straight back into pending,
+                            ' the next free worker will pick it up.
+                            On Error Resume Next
+                            If Not preserveExisting Then
+                                If Dir(pth(i)) <> "" Then Kill pth(i)
+                            End If
+                            On Error GoTo Fail
+
+                            st(i) = 0
+                            retriesUsed(i) = retriesUsed(i) + 1
+                            runningCount = runningCount - 1
+                            busy(wk(i)) = False
+                            somethingCompletedThisCycle = True
+                            retryCount = retryCount + 1
+                            firstSeenT(i) = #12:00:00 AM#
+                            lastSize(i) = 0
+                            stableHits(i) = 0
+                            LogStep "  TASK retry [" & i & "/" & n & "] TIMEOUT after " & _
+                                    taskTimeoutSec & "s (" & toFileState & _
+                                    ") - requeued (attempt " & (retriesUsed(i) + 1) & ")"
+                        Else
+                            ' Out of retries - mark as final failure.
+                            st(i) = 3
+                            finalSizes(i) = 0
+                            doneCount = doneCount + 1
+                            runningCount = runningCount - 1
+                            busy(wk(i)) = False
+                            somethingCompletedThisCycle = True
+                            If hadBackup(i) Then
+                                On Error Resume Next
+                                If Dir(pth(i)) <> "" Then Kill pth(i)
+                                If Dir(bak(i)) <> "" Then Name bak(i) As pth(i)
+                                If Dir(pth(i)) <> "" Then finalSizes(i) = FileLen(pth(i))
+                                On Error GoTo Fail
+                            End If
+                            LogStep "  TASK TIMEOUT [" & i & "/" & n & "] w" & wk(i) & _
+                                    " after " & taskTimeoutSec & "s (" & toFileState & _
+                                    ") - [" & lbl(i) & "] " & dsc(i)
+                        End If
+                    End If
                 End If
 ContinuePollingTask:
             End If
@@ -1450,6 +1495,7 @@ ContinuePollingTask:
                 "s = " & utilPct & "%"
     Next w
     LogStep "  DISP [" & passLabel & "] launches=" & launchCount & _
+            " inlineRetries=" & retryCount & _
             " dispatcher-sleep=" & (idleSleepMs \ 1000) & "." & _
             Format((idleSleepMs Mod 1000) \ 100, "0") & "s"
     Exit Sub
