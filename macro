@@ -81,7 +81,7 @@ Private Const IDNO  As Long = 7
 ' Anything below CAPTCHA_SIZE_HINT is suspiciously small and flagged
 ' for a retry, since Google's interstitial/CAPTCHA pages tend to
 ' render tiny compared to a normal 100-result SERP.
-Private Const TOOL_VERSION As String = "2.5.10"
+Private Const TOOL_VERSION As String = "2.5.11"
 Private Const MIN_PDF_SIZE_BYTES As Long = 5120
 Private Const CAPTCHA_SIZE_HINT As Long = 80000
 
@@ -255,6 +255,15 @@ Sub SearchAndSavePDF_Direct()
     LogStep "STEP 2: before AutoPrewarmDNS"
     AutoPrewarmDNS
     LogStep "STEP 2: after AutoPrewarmDNS"
+
+    ' Profile pre-warm: launch a tiny headless Edge against each
+    ' worker's user-data-dir so the profile is populated and any
+    ' first-run cost is paid while the analyst is still answering
+    ' prompts. Fire-and-forget; DrainPrewarmAndCleanup picks up the
+    ' pieces just before the real dispatch begins.
+    LogStep "STEP 2: before PrewarmEdgeProfiles"
+    PrewarmEdgeProfiles
+    LogStep "STEP 2: after PrewarmEdgeProfiles"
 
     ' Collect the small bits of input we need from the analyst:
     ' negative-news variants and any extra addresses.
@@ -910,6 +919,121 @@ Public Sub AutoPrewarmDNS()
     On Error GoTo 0
 End Sub
 
+' Pre-warms each worker's headless Edge profile by firing a tiny
+' --print-to-pdf of about:blank against every worker's user-data-dir.
+' That forces Edge to populate the first-run profile state (Local
+' State, Preferences, code caches, GPU cache) so the first real
+' search doesn't pay the cold-start tax. Each instance writes a
+' throwaway PDF and exits on its own.
+'
+' Fire-and-forget: we don't wait here. The user prompts that follow
+' (negative-news InputBoxes, sigma address dialog, etc.) give the
+' prewarm processes plenty of wall-clock time to finish on their own.
+' DrainPrewarmAndCleanup is called just before the real dispatch
+' starts to make sure no straggler is still holding a profile lock.
+Public Sub PrewarmEdgeProfiles()
+    On Error Resume Next
+
+    If Not USE_HEADLESS Then Exit Sub
+
+    Dim edgeExe As String
+    edgeExe = GetEdgePath
+    If Len(edgeExe) = 0 Then Exit Sub
+    If Dir(edgeExe) = "" Then Exit Sub
+
+    Dim wsh As Object: Set wsh = CreateObject("WScript.Shell")
+    Dim FSO As Object: Set FSO = CreateObject("Scripting.FileSystemObject")
+
+    Dim w As Long, profilePath As String, prewarmPdf As String, cmd As String
+    Dim fired As Long: fired = 0
+
+    For w = 0 To MAX_PARALLEL - 1
+        profilePath = GetWorkerProfilePath(w)
+        If Not FSO.FolderExists(profilePath) Then FSO.CreateFolder profilePath
+
+        prewarmPdf = Environ("TEMP") & "\osint_prewarm_w" & w & ".pdf"
+        If Dir(prewarmPdf) <> "" Then Kill prewarmPdf
+
+        ' Stripped-down version of the real headless cmd: same flags
+        ' that touch the profile dir, none of the search-specific bits.
+        cmd = """" & edgeExe & """" & _
+              " --headless=new" & _
+              " --disable-gpu" & _
+              " --user-data-dir=""" & profilePath & """" & _
+              " --no-first-run" & _
+              " --no-default-browser-check" & _
+              " --disable-logging --log-level=3" & _
+              " --disable-background-networking" & _
+              " --disable-sync" & _
+              " --disable-default-apps" & _
+              " --disable-component-update" & _
+              " --disable-client-side-phishing-detection" & _
+              " --metrics-recording-only" & _
+              " --mute-audio" & _
+              " --print-to-pdf=""" & prewarmPdf & """" & _
+              " about:blank"
+
+        wsh.Run cmd, 0, False
+        fired = fired + 1
+    Next w
+
+    If fired > 0 Then
+        LogStep "PREWARM: fired " & fired & " Edge profile warmer(s) - " & _
+                "running in background while user is prompted"
+    End If
+
+    On Error GoTo 0
+End Sub
+
+' Called just before the real dispatch starts. In the common case
+' the prewarm Edge processes have already exited on their own (the
+' prewarm PDFs exist on disk), so this is a no-op cleanup. If the
+' user blew through prompts faster than expected we wait a short
+' grace period and then kill any straggler holding a profile lock.
+' Even a partially-warmed profile still gets us most of the
+' cold-start saving, since the profile dir was populated.
+Private Sub DrainPrewarmAndCleanup()
+    On Error Resume Next
+
+    Dim w As Long, prewarmPdf As String
+    Dim drainStartT As Single: drainStartT = Timer
+    Dim allDone As Boolean
+
+    Do
+        allDone = True
+        For w = 0 To MAX_PARALLEL - 1
+            prewarmPdf = Environ("TEMP") & "\osint_prewarm_w" & w & ".pdf"
+            If Dir(prewarmPdf) = "" Then
+                allDone = False
+                Exit For
+            End If
+        Next w
+        If allDone Then Exit Do
+        ' 2 s ceiling is plenty - print-to-pdf of about:blank is sub-second
+        ' on every VDI we've seen. Beyond that we just kill and move on.
+        If Timer - drainStartT > 2 Then Exit Do
+        SmartWait 0.1, True
+    Loop
+
+    ' Belt-and-braces: kill any straggler msedge.exe still bound to
+    ' our worker profiles. No-op if prewarm already exited cleanly.
+    For w = 0 To MAX_PARALLEL - 1
+        KillEdgeWorkerProcesses w
+    Next w
+
+    ' Drop the throwaway prewarm PDFs - they were just the trigger
+    ' that got Edge to print-and-exit, the real searches don't need them.
+    For w = 0 To MAX_PARALLEL - 1
+        prewarmPdf = Environ("TEMP") & "\osint_prewarm_w" & w & ".pdf"
+        If Dir(prewarmPdf) <> "" Then Kill prewarmPdf
+    Next w
+
+    LogStep "PREWARM: drain done in " & Format(Timer - drainStartT, "0.00") & "s" & _
+            " (allDone=" & allDone & ")"
+
+    On Error GoTo 0
+End Sub
+
 ' Nudge Excel to the top so the next InputBox / MsgBox isn't hidden
 ' behind something. Cheap insurance against the classic VDI bug
 ' where a prompt shows up off-screen and the macro looks frozen.
@@ -1072,6 +1196,12 @@ Private Function RunSearchBatchParallel(tasks As Collection, wsh As Object) As L
 
     Dim batchStartT As Single: batchStartT = Timer
     LogStep "BATCH ALL start, n=" & n & ", maxParallel=" & MAX_PARALLEL
+
+    ' Make sure the profile pre-warm Edge processes have either
+    ' exited cleanly or been killed before we try to grab the
+    ' worker user-data-dirs. Usually they're long gone by now -
+    ' this is a sub-50 ms no-op in the typical case.
+    DrainPrewarmAndCleanup
 
     ' Single main pass with inline retries (max 1 per task). Tasks
     ' that come back as CAPTCHA-size or that time out are requeued
