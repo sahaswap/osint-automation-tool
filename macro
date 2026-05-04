@@ -81,7 +81,7 @@ Private Const IDNO  As Long = 7
 ' Anything below CAPTCHA_SIZE_HINT is suspiciously small and flagged
 ' for a retry, since Google's interstitial/CAPTCHA pages tend to
 ' render tiny compared to a normal 100-result SERP.
-Private Const TOOL_VERSION As String = "2.5.11"
+Private Const TOOL_VERSION As String = "2.5.12"
 Private Const MIN_PDF_SIZE_BYTES As Long = 5120
 Private Const CAPTCHA_SIZE_HINT As Long = 80000
 
@@ -139,6 +139,15 @@ Sub SearchAndSavePDF_Direct()
     Kill Environ("TEMP") & "\osint_debug.log"
     On Error GoTo ErrorHandler
     LogStep "=== Macro started (v" & TOOL_VERSION & ") ==="
+
+    ' Self-heal entry guard. If the previous run died before its
+    ' AutoRestoreRuntime fired (VBE Reset, "End" on a runtime error,
+    ' Excel killed mid-batch), Excel is still in our muted mode and
+    ' every formula on the workbook is showing the yellow "Stale"
+    ' badge with the value struck through. Backend / hidden sheets
+    ' can't be fixed by the analyst from the ribbon, so we recover
+    ' here before doing anything else. No-op if state is already clean.
+    ForceClearStaleOSINTState
 
     ' ---- Declarations ----
     Dim ws As Worksheet, auditWs As Worksheet, masterWs As Worksheet
@@ -531,14 +540,9 @@ Sub SearchAndSavePDF_Direct()
     auditWs.Cells(nextAuditRow, 7).Value = TOOL_VERSION
     ThisWorkbook.Save
 
-    ' Give Excel its settings back and pop the folder open right away
-    ' so the analyst sees the PDFs while we push to SharePoint below.
+    ' Hand Excel back to the user. Folder open is deferred until
+    ' after they dismiss the success dialog (analyst-requested UX).
     AutoRestoreRuntime
-    Application.StatusBar = "OSINT: Opening folder and syncing to SharePoint..."
-
-    On Error Resume Next
-    shell "explorer.exe """ & mainFolderPath & """", vbNormalFocus
-    On Error GoTo ErrorHandler
 
     ' Push a row to the shared SharePoint tracker so the team can
     ' see this run. Failures here are non-fatal - the local audit
@@ -624,33 +628,22 @@ Sub SearchAndSavePDF_Direct()
     Application.StatusBar = False
 
     '--------------------------------------------------------------
-    ' STEP 11: Final summary dialog (includes SP status)
+    ' STEP 11: Final summary dialog -> folder open on OK
     '--------------------------------------------------------------
     AppActivate Application.Caption
 
     Dim summary As String
     summary = "All done! I saved " & actualSearchCount & " PDF(s) directly into:" & vbCrLf & _
               "  " & ecmCase & "\OSDD Searches" & vbCrLf & vbCrLf & _
-              "Total search time: " & timeString & vbCrLf & vbCrLf
+              "Total search time: " & timeString
 
-    Select Case True
-        Case spSyncStatus = "OK"
-            summary = summary & "SharePoint master tracker: updated." & vbCrLf & _
-                      "Your local Audit_Log also has this run."
-        Case spSyncStatus = "SKIPPED"
-            summary = summary & "SharePoint master tracker: not attempted." & vbCrLf & _
-                      "Your local Audit_Log has this run."
-        Case Else
-            summary = summary & "WARNING: SharePoint master tracker was NOT updated." & vbCrLf & _
-                      spSyncStatus & vbCrLf & vbCrLf & _
-                      "Your local Audit_Log still has this run. Please notify the team lead."
-    End Select
+    MsgBox summary, vbInformation, "Success"
 
-    If spSyncStatus = "OK" Or spSyncStatus = "SKIPPED" Then
-        MsgBox summary, vbInformation, "Success"
-    Else
-        MsgBox summary, vbExclamation, "Success - SharePoint sync failed"
-    End If
+    ' User dismissed the dialog - now pop the case folder so they
+    ' land on the freshly-saved PDFs.
+    On Error Resume Next
+    shell "explorer.exe """ & mainFolderPath & """", vbNormalFocus
+    On Error GoTo ErrorHandler
 
     Set WshShell = Nothing
     Set FSO = Nothing
@@ -814,6 +807,112 @@ Public Sub AutoRestoreRuntime()
     End With
 
     m_runtimeApplied = False
+    On Error GoTo 0
+End Sub
+
+' If a previous OSINT run died before AutoRestoreRuntime fired
+' (VBE Reset, "End" on a runtime error, Excel killed mid-batch...)
+' Excel stays in our muted mode: Calculation = manual, EnableEvents
+' off, DisplayAlerts off, etc. In Excel 365 that shows up on every
+' formula as a yellow "Stale" badge with the value struck through,
+' which is alarming on hidden backend sheets the analyst can't fix
+' from the ribbon.
+'
+' This sub force-clears that residue. It only intervenes when it
+' sees clear OSINT-shaped fingerprints (our status-bar prefix, or
+' the trifecta of muted Excel toggles) so it never accidentally
+' overrides a user who genuinely keeps Excel on manual calc.
+Private Sub ForceClearStaleOSINTState()
+    On Error Resume Next
+
+    Dim looksStale As Boolean
+    looksStale = False
+
+    ' Smoking gun #1: our own status-bar message is still up.
+    Dim sb As Variant
+    sb = Application.StatusBar
+    If VarType(sb) = vbString Then
+        If InStr(1, CStr(sb), "OSINT", vbTextCompare) > 0 Then looksStale = True
+    End If
+
+    ' Smoking gun #2: the trifecta of toggles we mute together.
+    ' A normal user would never have all three flipped at once.
+    If Not looksStale Then
+        If Application.Calculation = xlCalculationManual And _
+           Application.EnableEvents = False And _
+           Application.DisplayAlerts = False Then
+            looksStale = True
+        End If
+    End If
+
+    If Not looksStale Then Exit Sub
+
+    LogStep "RECOVER: stale OSINT state detected on entry - force-clearing " & _
+            "(calc/events/alerts/cursor/screen/print/statusbar)"
+
+    With Application
+        .Calculation = xlAutomatic
+        .EnableEvents = True
+        .ScreenUpdating = True
+        .DisplayAlerts = True
+        .Cursor = xlDefault
+        .PrintCommunication = True
+        .StatusBar = False
+    End With
+
+    ' Lift any background-app priorities the dead run lowered.
+    ' Safe no-op if nothing is currently tuned down.
+    RestoreBackgroundApps
+
+    ' Reset our flag so the new run's AutoPrepareRuntime starts
+    ' from a clean baseline (it'll save the freshly-restored state
+    ' as the "original" to put back later).
+    m_runtimeApplied = False
+
+    On Error GoTo 0
+End Sub
+
+' Public, manual-recovery entry point. Bind it to a button or run
+' it from Alt+F8 if the workbook ever ends up with "Stale" cell
+' indicators / events not firing / formulas not recalculating
+' after an OSINT run that didn't tear down cleanly.
+'
+' Safe to run any time - it's a no-op if there's nothing to clean.
+Public Sub OSINT_RecoverState()
+    On Error Resume Next
+
+    Dim took As String
+
+    ' Authoritative path: we have saved originals from a still-live
+    ' AutoPrepareRuntime, restore them exactly.
+    If m_runtimeApplied Then
+        AutoRestoreRuntime
+        took = "Restored Excel state from saved originals."
+    Else
+        ' Fallback path: no saved originals, but state may still
+        ' look stuck. ForceClearStaleOSINTState only fires if it
+        ' sees real OSINT residue.
+        ForceClearStaleOSINTState
+        took = "Force-cleared any leftover OSINT state. " & _
+               "(If Excel was already healthy, nothing changed.)"
+    End If
+
+    ' Always-safe housekeeping regardless of which path ran.
+    Application.StatusBar = False
+    RestoreBackgroundApps
+
+    ' Nudge a recalc so any "Stale" badges clear immediately
+    ' instead of waiting for the next edit.
+    On Error Resume Next
+    Application.CalculateFull
+    On Error GoTo 0
+
+    MsgBox took & vbCrLf & vbCrLf & _
+           "Calculation, events, alerts, screen updates, status bar and " & _
+           "background-app priorities are back to defaults. " & _
+           "Stale-cell indicators have been cleared.", _
+           vbInformation, "OSINT Recover"
+
     On Error GoTo 0
 End Sub
 
